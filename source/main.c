@@ -7,7 +7,7 @@
 //   X (hold) .......... sus4             Y ........... next sound
 //   A ................. major / minor    B ........... next voicing
 //   D-pad L/R ......... key down / up    D-pad U/D ... octave up / down
-//   SELECT ............ play mode (HOLD / LATCH / STRUM / ARP / EXPRESS)
+//   SELECT ............ play mode (HOLD / LATCH / STRUM / ARP / EXPRESS / JOYSTICK)
 //   Circle pad up/down  filter cutoff    Circle pad L/R pitch bend (arp speed in ARP)
 //   START ............. quit
 //
@@ -17,6 +17,13 @@
 //   Touch position across pad = strum (left = block chord, right = slow strum)
 //   Slide left/right while holding = pitch bend   Circle pad L/R = inversion
 //   L (hold) = down-strum   R (hold) = humanize   X (hold) = sustain pedal
+//
+// JOYSTICK mode (HiChord-style):
+//   Top row = 7 chord pads (diatonic to key + scale), hold to play; slide between pads to change
+//   Circle pad = 8-way chord modifier while holding (maps: Default / Extended / Chromatic / Borrow)
+//   Strum plate = swipe across 16 strings tuned to the current chord (tap for single notes)
+//   L = lock current modifier   R = next stick map   A = next scale (10)   B = bass OFF/ROOT/SLASH
+//   X = pad strum speed OFF / SLOW / MED / FAST     Y = sound            D-pad = key / octave
 // Top screen shows a keyboard lighting up the notes that are sounding.
 
 #include <3ds.h>
@@ -28,7 +35,7 @@
 #define SR          32000
 #define BUF_SAMPLES 512
 #define NBUFS       4
-#define MAXV        16
+#define MAXV        24
 #define MAXN        8
 #define TWO_PI      6.28318530718f
 
@@ -154,6 +161,7 @@ typedef struct {
 	float freq, env, relRate;
 	float ph[3];
 	float pan, vel;
+	int tag, gate;       // tag: 1 chord, 2 strum string; gate: samples until auto-release
 	unsigned age;
 } Voice;
 
@@ -169,7 +177,7 @@ static int exprFilter = 0;                         // dynamics also open the fil
 
 static float mtof(int n) { return 440.0f * powf(2.0f, (n - 69) / 12.0f); }
 
-static void noteOn(int note, int delaySamples, float vel) {
+static Voice* noteOn(int note, int delaySamples, float vel) {
 	int best = -1; unsigned oldest = 0xffffffff;
 	for (int i = 0; i < MAXV; i++) if (!voices[i].active) { best = i; break; }
 	if (best < 0) {
@@ -186,7 +194,9 @@ static void noteOn(int note, int delaySamples, float vel) {
 	v->ph[0] = 0.0f; v->ph[1] = 0.33f; v->ph[2] = 0.71f;
 	v->pan = 0.5f + 0.35f * sinf(note * 1.7f);
 	v->vel = vel;
+	v->tag = 1;
 	v->age = voiceAge++;
+	return v;
 }
 
 static void releaseVoice(Voice* v) {
@@ -199,6 +209,7 @@ static void releaseVoice(Voice* v) {
 }
 
 static void releaseAll(void) { for (int i = 0; i < MAXV; i++) releaseVoice(&voices[i]); }
+static void releaseTag(int tag) { for (int i = 0; i < MAXV; i++) if (voices[i].tag == tag) releaseVoice(&voices[i]); }
 
 static inline float polyblep(float t, float dt) {
 	if (t < dt) { t /= dt; return t + t - t * t - 1.0f; }
@@ -272,6 +283,7 @@ static void fillAudio(s16* out, int n) {
 			Voice* v = &voices[i];
 			if (!v->active) continue;
 			if (v->stage == 0) { if (--v->delay <= 0) v->stage = 1; else continue; }
+			if (v->gate > 0 && --v->gate == 0) releaseVoice(v);
 			switch (v->stage) {
 			case 1: v->env += aInc; anyAttack = 1; if (v->env >= 1.0f) { v->env = 1.0f; v->stage = 2; } break;
 			case 2: v->env -= dDec; if (v->env <= P->s) { v->env = P->s; v->stage = 3; } break;
@@ -397,6 +409,200 @@ static int xVoice(const XChord* c, int key, int oct, int inv, int* out) {
 	return n;
 }
 
+// ---------------------------------------------------------------- JOYSTICK mode (HiChord-style)
+// 7 diatonic chord pads + circle pad as an 8-way chord-modifier joystick + strum plate.
+static const char* SCALE_NAMES[10] = {"MAJOR","MINOR","HARM MIN","MEL MIN","MAJ PENT","MIN PENT","BLUES","DORIAN","MIXOLYD","LYDIAN"};
+static const int JSC[10][7] = {
+	{0,2,4,5,7,9,11}, {0,2,3,5,7,8,10}, {0,2,3,5,7,8,11}, {0,2,3,5,7,9,11},
+	{0,2,4,5,7,9,11}, {0,2,3,5,7,8,10}, {0,2,3,5,7,8,10}, // pentatonics/blues use parent scale for chords
+	{0,2,3,5,7,9,10}, {0,2,4,5,7,9,10}, {0,2,4,6,7,9,11}
+};
+enum { MAP_DEFAULT, MAP_EXTENDED, MAP_CHROMATIC, MAP_BORROW, MAP_COUNT };
+static const char* MAP_NAMES[MAP_COUNT] = {"DEFAULT", "EXTENDED", "CHROMATIC", "BORROW"};
+// directions: 0 up, 1 up-right, 2 right, 3 down-right, 4 down, 5 down-left, 6 left, 7 up-left
+static const char* DIR_LABELS[MAP_COUNT][8] = {
+	{"MAJ/MIN", "DOM7", "MAJ7/M7", "9TH", "SUS4", "6/SUS2", "DIM/MIN", "AUG"},
+	{"MAJ/MIN", "DOM9", "ADD11", "MIN11", "7#9", "ADD9", "7SUS4", "HALF-DIM"},
+	{"MMAJ7", "7ALT", "+1 SEMI", "HALF-DIM", "MAJ13", "6/9", "-1 SEMI", "7B9"},
+	{"SEC DOM", "BACKDOOR", "PASS DIM7", "HALF-DIM", "PARALLEL", "BORROW 7", "FLAT MAJ", "TRITONE"},
+};
+static const char* BASS_NAMES[3] = {"OFF", "ROOT", "SLASH"};
+static const char* STRUM_NAMES[4] = {"OFF", "SLOW", "MED", "FAST"};
+static const float STRUM_SEC[4] = {0.0f, 0.200f, 0.080f, 0.040f};
+
+typedef struct { int root; int iv[7]; int n; } JChord;
+
+static void jSet(JChord* c, int n, const int* iv) { c->n = n; for (int i = 0; i < n; i++) c->iv[i] = iv[i]; }
+static int jHas(const JChord* c, int x) { for (int i = 0; i < c->n; i++) if (c->iv[i] == x) return 1; return 0; }
+static void jAdd(JChord* c, int x) { if (!jHas(c, x) && c->n < 7) c->iv[c->n++] = x; }
+static void jRep(JChord* c, int from, int to) { for (int i = 0; i < c->n; i++) if (c->iv[i] == from) c->iv[i] = to; }
+
+static int isMajorScale(int sc) { return JSC[sc][2] == 4; }
+
+static void jTriad(JChord* c, int sc, int deg, int with7) {
+	const int* s = JSC[sc];
+	c->root = s[deg];
+	int t = sdeg(s, deg + 2) - c->root, f = sdeg(s, deg + 4) - c->root;
+	c->n = 0; c->iv[c->n++] = 0; c->iv[c->n++] = t; c->iv[c->n++] = f;
+	if (with7) c->iv[c->n++] = sdeg(s, deg + 6) - c->root;
+}
+
+static void joyBuild(JChord* c, int sc, int deg, int map, int dir) {
+	jTriad(c, sc, deg, 0);
+	int t = c->iv[1], f = c->iv[2];
+	int dim = (t == 3 && f == 6), maj = (t == 4);
+	if (dir < 0) return;
+	switch (map) {
+	case MAP_DEFAULT:
+		switch (dir) {
+		case 0: jRep(c, t, t == 4 ? 3 : 4); break;
+		case 1: jAdd(c, 10); break;
+		case 2: jAdd(c, dim ? 10 : (maj ? 11 : 10)); break;
+		case 3: if (dim) jAdd(c, 10); else { jAdd(c, sdeg(JSC[sc], deg + 6) - c->root); jAdd(c, 14); } break;
+		case 4: jRep(c, t, 5); break;
+		case 5: if (maj) jAdd(c, 9); else jRep(c, t, 2); break;
+		case 6: if (dim) jRep(c, 6, 7); else { jRep(c, t, 3); jRep(c, f, 6); } break;
+		case 7: jRep(c, t, 4); jRep(c, f, 8); break;
+		}
+		break;
+	case MAP_EXTENDED:
+		switch (dir) {
+		case 0: jRep(c, t, t == 4 ? 3 : 4); break;
+		case 1: jSet(c, 5, (int[]){0,4,7,10,14}); break;
+		case 2: jAdd(c, 17); break;
+		case 3: jSet(c, 6, (int[]){0,3,7,10,14,17}); break;
+		case 4: jSet(c, 5, (int[]){0,4,7,10,15}); break;
+		case 5: jAdd(c, 14); break;
+		case 6: jSet(c, 4, (int[]){0,5,7,10}); break;
+		case 7: jSet(c, 4, (int[]){0,3,6,10}); break;
+		}
+		break;
+	case MAP_CHROMATIC:
+		switch (dir) {
+		case 0: jSet(c, 4, (int[]){0,3,7,11}); break;
+		case 1: jSet(c, 5, (int[]){0,4,10,15,20}); break;
+		case 2: c->root += 1; break;
+		case 3: jSet(c, 4, (int[]){0,3,6,10}); break;
+		case 4: jSet(c, 6, (int[]){0,4,7,11,14,21}); break;
+		case 5: jSet(c, 5, (int[]){0,4,7,9,14}); break;
+		case 6: c->root -= 1; break;
+		case 7: jSet(c, 5, (int[]){0,4,7,10,13}); break;
+		}
+		break;
+	case MAP_BORROW: {
+		int par = isMajorScale(sc) ? 1 : 0; // parallel: major <-> natural minor
+		switch (dir) {
+		case 0: c->root += 7; jSet(c, 4, (int[]){0,4,7,10}); break;          // secondary dominant
+		case 1: c->root -= 2; jSet(c, 4, (int[]){0,4,7,10}); break;          // backdoor dom7
+		case 2: c->root += 1; jSet(c, 4, (int[]){0,3,6,9}); break;           // passing dim7
+		case 3: jSet(c, 4, (int[]){0,3,6,10}); break;                        // half-dim
+		case 4: jTriad(c, par, deg, 0); break;                               // parallel major/minor
+		case 5: jTriad(c, par, deg, 1); break;                               // borrowed 7th
+		case 6: c->root -= 1; jSet(c, 3, (int[]){0,4,7}); break;             // flat-side major
+		case 7: c->root += 1; jSet(c, 4, (int[]){0,4,7,10}); break;          // tritone sub
+		}
+		break;
+	}
+	}
+	qsort(c->iv, c->n, sizeof(int), cmpInt);
+}
+
+typedef struct { int n; int iv[6]; const char* q; } QName;
+static const QName QNAMES[] = {
+	{2,{4,7},""}, {2,{3,7},"m"}, {2,{3,6},"dim"}, {2,{4,8},"aug"}, {2,{5,7},"sus4"}, {2,{2,7},"sus2"},
+	{2,{4,6},"(b5)"},
+	{3,{4,7,10},"7"}, {3,{4,7,11},"maj7"}, {3,{3,7,10},"m7"}, {3,{3,6,10},"m7b5"}, {3,{3,6,9},"dim7"},
+	{3,{3,7,11},"m(maj7)"}, {3,{4,7,9},"6"}, {3,{3,7,9},"m6"}, {3,{5,7,10},"7sus4"}, {3,{4,8,10},"aug7"},
+	{3,{4,7,14},"add9"}, {3,{3,7,14},"madd9"}, {3,{4,7,17},"add11"}, {3,{3,7,17},"madd11"},
+	{3,{4,8,11},"augmaj7"}, {3,{2,7,9},"6sus2"},
+	{4,{4,7,10,14},"9"}, {4,{4,7,11,14},"maj9"}, {4,{3,7,10,14},"m9"}, {4,{4,7,10,15},"7#9"},
+	{4,{4,7,10,13},"7b9"}, {4,{4,10,15,20},"7alt"}, {4,{4,7,9,14},"6/9"}, {4,{3,6,10,14},"m9b5"},
+	{4,{4,7,10,17},"11"}, {4,{4,7,11,17},"maj7add11"}, {4,{3,7,10,17},"m7add11"}, {4,{3,6,10,17},"m11b5"},
+	{4,{3,7,11,14},"m(maj9)"}, {4,{4,7,9,17},"6add11"}, {4,{2,7,9,14},"6sus2"},
+	{5,{3,7,10,14,17},"m11"}, {5,{4,7,11,14,21},"maj13"}, {5,{4,7,10,14,17},"11"},
+};
+
+static void joyName(const JChord* c, int key, char* out, int len) {
+	int pc = ((key + c->root) % 12 + 12) % 12;
+	int m = c->n - 1;
+	for (unsigned k = 0; k < sizeof(QNAMES) / sizeof(QNAMES[0]); k++) {
+		if (QNAMES[k].n != m) continue;
+		int ok = 1;
+		for (int i = 0; i < m; i++) if (QNAMES[k].iv[i] != c->iv[i + 1]) { ok = 0; break; }
+		if (ok) { snprintf(out, len, "%s%s", NOTE_NAMES[pc], QNAMES[k].q); return; }
+	}
+	// fallback: triad name + extensions
+	static const struct { int t, f; const char* q; } TRI[] = {
+		{4,7,""},{3,7,"m"},{3,6,"dim"},{4,8,"aug"},{5,7,"sus4"},{2,7,"sus2"},{5,6,"sus4b5"},
+		{2,6,"sus2b5"},{3,8,"m#5"},{4,6,"(b5)"},{5,8,"sus4#5"},{2,8,"sus2#5"}};
+	const char* base = "?";
+	if (c->n >= 3) for (unsigned k = 0; k < sizeof(TRI) / sizeof(TRI[0]); k++)
+		if (TRI[k].t == c->iv[1] && TRI[k].f == c->iv[2]) { base = TRI[k].q; break; }
+	char ext[24] = "";
+	for (int i = 3; i < c->n; i++) {
+		const char* e = "";
+		switch (c->iv[i]) {
+		case 9: e = "6"; break;   case 10: e = "7"; break;   case 11: e = "maj7"; break;
+		case 13: e = "b9"; break; case 14: e = "9"; break;   case 15: e = "#9"; break;
+		case 17: e = "11"; break; case 18: e = "#11"; break; case 20: e = "b13"; break;
+		case 21: e = "13"; break;
+		}
+		if (strlen(ext) + strlen(e) + 4 < sizeof(ext)) { strcat(ext, i == 3 ? "add" : ","); strcat(ext, e); }
+	}
+	snprintf(out, len, "%s%s%s", NOTE_NAMES[pc], base, ext);
+}
+
+// voice-led placement: pick the inversion/octave whose centre is closest to the target
+static float jPrevCentre = 60.0f;
+static int joyVoice(const JChord* c, int key, int oct, int bassMode, int* out) {
+	int k0 = key > 5 ? key - 12 : key;
+	float home = 60.0f + k0 + 12 * oct;
+	float target = 0.7f * jPrevCentre + 0.3f * home;
+	int n = c->n, best[8], bn = 0; float bestCost = 1e9f;
+	for (int inv = 0; inv < n; inv++) {
+		for (int o = -3; o <= 3; o++) {
+			int tmp[8];
+			for (int i = 0; i < n; i++) tmp[i] = 48 + k0 + c->root + c->iv[i] + 12 * o + (i < inv ? 12 : 0);
+			qsort(tmp, n, sizeof(int), cmpInt);
+			if (tmp[0] < 40 || tmp[n - 1] > 96) continue;
+			float mean = 0; for (int i = 0; i < n; i++) mean += tmp[i]; mean /= n;
+			float cost = fabsf(mean - target) + 0.08f * (tmp[n - 1] - tmp[0]);
+			if (cost < bestCost) { bestCost = cost; memcpy(best, tmp, sizeof(tmp)); bn = n; }
+		}
+	}
+	if (bn == 0) { for (int i = 0; i < n; i++) best[i] = 60 + k0 + c->root + c->iv[i]; bn = n; }
+	float mean = 0; for (int i = 0; i < bn; i++) mean += best[i]; jPrevCentre = mean / bn;
+	int cnt = 0;
+	if (bassMode) {
+		int bi = 0; // ROOT
+		if (bassMode == 2) { // SLASH: 5th; 3rd on minor; sus note on sus chords
+			int t = c->n > 1 ? c->iv[1] : 0;
+			if (t == 2 || t == 5) bi = t;
+			else if (t == 3) bi = 3;
+			else bi = jHas(c, 7) ? 7 : (jHas(c, 6) ? 6 : (jHas(c, 8) ? 8 : 0));
+		}
+		int pc = ((k0 + c->root + bi) % 12 + 12) % 12;
+		int b = 36 + pc + 12 * oct; if (oct > 0) b -= 12 * oct; // keep bass low
+		while (b >= best[0] - 5) b -= 12;
+		if (b < 28) b += 12;
+		out[cnt++] = b;
+	}
+	for (int i = 0; i < bn && cnt < MAXN; i++) out[cnt++] = best[i];
+	return cnt;
+}
+
+// strum plate: 16 strings across the current chord's pitch classes
+#define NSTRINGS 16
+static int joyStrings(const JChord* c, int key, int oct, int* out) {
+	int k0 = key > 5 ? key - 12 : key;
+	int pcs[12] = {0};
+	for (int i = 0; i < c->n; i++) pcs[(((k0 + c->root + c->iv[i]) % 12) + 12) % 12] = 1;
+	int n = 0;
+	for (int note = 43 + 12 * oct; n < NSTRINGS && note < 128; note++)
+		if (note >= 0 && pcs[note % 12]) out[n++] = note;
+	return n;
+}
+
 // ---------------------------------------------------------------- drawing (both screens)
 static u8* fb;
 static int fbW = 320;
@@ -440,8 +646,8 @@ static const u8 PADCOL[12][3] = {
 	{220, 90, 90},{150, 90,190},{ 60,160,180},{190,130, 60}
 };
 
-enum { M_HOLD, M_LATCH, M_STRUM, M_ARP, M_EXPRESS, M_COUNT };
-static const char* MODE_NAMES[M_COUNT] = {"HOLD", "LATCH", "STRUM", "ARP", "EXPRESS"};
+enum { M_HOLD, M_LATCH, M_STRUM, M_ARP, M_EXPRESS, M_JOY, M_COUNT };
+static const char* MODE_NAMES[M_COUNT] = {"HOLD", "LATCH", "STRUM", "ARP", "EXPRESS", "JOYSTICK"};
 
 // pad geometry: classic = 4x2 (80x100), express = 4x3 (80x66)
 static int padRows(int mode) { return mode == M_EXPRESS ? 3 : 2; }
@@ -472,6 +678,50 @@ static void drawBottom(int mode, int key, int minor, int add7, int add9, int sus
 			drawTextC(x + 40, y + (sc == 2 ? 44 : 48), c.name, sc, 255, 255, 255);
 		}
 	}
+	rect(0, 200, 320, 40, 30, 26, 34);
+	drawText(6, 206, status, 1, 255, 200, 120);
+	drawText(6, 222, hint, 1, 170, 160, 180);
+}
+
+// JOYSTICK mode bottom screen: 7 chord pads on top, strum plate below
+#define JPAD_H   72
+#define PLATE_Y  78
+#define PLATE_H  120
+static int stringX(int i) { return 10 + i * 20; }
+
+static void drawPlate(const int* strings, int ns, const int* flash) {
+	fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL); fbW = 320;
+	rect(0, PLATE_Y, 320, PLATE_H, 22, 18, 26);
+	rect(3, PLATE_Y + 2, 314, 2, 60, 50, 70);
+	for (int i = 0; i < ns; i++) {
+		int x = stringX(i);
+		int f = flash[i];
+		if (f > 0) rect(x - 2, PLATE_Y + 6, 5, PLATE_H - 26, 255, 170 + f * 10 > 255 ? 255 : 170 + f * 10, 80);
+		else rect(x, PLATE_Y + 6, 1 + (strings[i] < 55), PLATE_H - 26, 200, 185, 160);
+		char nm[4]; snprintf(nm, sizeof(nm), "%s", NOTE_NAMES[strings[i] % 12]);
+		drawChar(x - 3, PLATE_Y + PLATE_H - 16, nm[0], 1, f > 0 ? 255 : 150, f > 0 ? 200 : 140, f > 0 ? 120 : 160);
+	}
+}
+
+static void drawJoyBottom(int key, int sc, int activeDeg, const int* strings, int ns, const int* flash,
+                          const char* status, const char* hint) {
+	fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL); fbW = 320;
+	rect(0, 0, 320, PLATE_Y, 16, 14, 18);
+	for (int i = 0; i < 7; i++) {
+		int x0 = i * 320 / 7, x1 = (i + 1) * 320 / 7, w = x1 - x0;
+		JChord c; jTriad(&c, sc, i, 0);
+		char name[16]; joyName(&c, key, name, sizeof(name));
+		const u8* col = PADCOL[i];
+		float k = (i == activeDeg) ? 1.0f : 0.38f;
+		rect(x0 + 2, 3, w - 4, JPAD_H - 6, col[0] * k, col[1] * k, col[2] * k);
+		if (i == activeDeg) frame(x0 + 2, 3, w - 4, JPAD_H - 6, 255, 255, 255);
+		char rn[8];
+		int t = c.iv[1], f = c.iv[2];
+		snprintf(rn, sizeof(rn), "%s%s", t == 4 ? ROMAN[i] : ROMAN_LC[i], (t == 3 && f == 6) ? "o" : (f == 8 ? "+" : ""));
+		drawTextC(x0 + w / 2, 12, rn, 1, 255, 240, 220);
+		drawTextC(x0 + w / 2, 36, name, 1, 255, 255, 255);
+	}
+	drawPlate(strings, ns, flash);
 	rect(0, 200, 320, 40, 30, 26, 34);
 	drawText(6, 206, status, 1, 255, 200, 120);
 	drawText(6, 222, hint, 1, 170, 160, 180);
@@ -515,8 +765,8 @@ static void drawKeyboard(const u8* on, int keyPc) {
 	}
 }
 
-static void drawTopInfo(int audioOK, int mode, int key, int minor, int oct, int voicing, int xset,
-                        int xinv, const char* chordName, const char* roman, const int* notes, int nn) {
+static void drawTopInfo(int audioOK, int mode, const char* chordName, const char* roman,
+                        const int* notes, int nn, const char* row1, const char* row2) {
 	fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL); fbW = 400;
 	rect(0, 0, 400, KB_Y - 14, 16, 14, 18);
 	drawText(8, 6, "ChordBox", 2, 255, 160, 60);
@@ -533,16 +783,8 @@ static void drawTopInfo(int audioOK, int mode, int key, int minor, int oct, int 
 		len += snprintf(line + len, sizeof(line) - len, "%s%d ", NOTE_NAMES[notes[i] % 12], notes[i] / 12 - 1);
 	drawTextC(200, 92, line, 1, 200, 190, 210);
 
-	// settings row
-	char row[64];
-	if (mode == M_EXPRESS)
-		snprintf(row, sizeof(row), "SET %s  TRANSPOSE %+d  OCT %+d  INV %+d", XSETS[xset].name, key > 5 ? key - 12 : key, oct, xinv);
-	else
-		snprintf(row, sizeof(row), "KEY %s %s  OCT %+d  %s", NOTE_NAMES[key], minor ? "MIN" : "MAJ", oct,
-			VOICING_NAMES[voicing]);
-	drawTextC(200, 112, row, 1, 255, 200, 120);
-	snprintf(row, sizeof(row), "SOUND: %s", PATCHES[patchIdx].name);
-	drawTextC(200, 126, row, 1, 255, 200, 120);
+	drawTextC(200, 112, row1, 1, 255, 200, 120);
+	drawTextC(200, 126, row2, 1, 255, 200, 120);
 	if (!audioOK) drawTextC(200, 140, "NO AUDIO - run DSP1 once (dspfirm.cdc)", 1, 255, 80, 80);
 }
 
@@ -590,22 +832,33 @@ int main(void) {
 	float xU = 0.0f, xV = 0.0f;
 	u8 kbOn[128], kbPrev[128];
 	memset(kbPrev, 0xff, sizeof(kbPrev));
+	// joystick-mode state
+	int jScale = 0, jMap = MAP_DEFAULT, jBass = 1, jStrum = 0, jDeg = -1, jHeld = 0;
+	int jDir = -1, jLock = -1, jPrevEff = -2, jPrevString = -1, jInPlate = 0;
+	int jStrings[NSTRINGS], jNs = 0, jFlash[NSTRINGS], jPlateDirty = 0;
+	memset(jFlash, 0, sizeof(jFlash));
 
 	while (aptMainLoop()) {
 		hidScanInput();
 		u32 kDown = hidKeysDown(), kHeld = hidKeysHeld(), kUp = hidKeysUp();
 		if (kDown & KEY_START) break;
-		int express = (mode == M_EXPRESS);
+		int express = (mode == M_EXPRESS), joy = (mode == M_JOY);
 
 		int add7 = 0, add9 = 0, sus = 0;
-		if (!express) { add7 = !!(kHeld & KEY_L); add9 = !!(kHeld & KEY_R); sus = !!(kHeld & KEY_X); }
+		if (!express && !joy) { add7 = !!(kHeld & KEY_L); add9 = !!(kHeld & KEY_R); sus = !!(kHeld & KEY_X); }
 
 		if (kDown & KEY_DRIGHT) { key = (key + 1) % 12; dirty = topDirty = 1; }
 		if (kDown & KEY_DLEFT)  { key = (key + 11) % 12; dirty = topDirty = 1; }
 		if (kDown & KEY_DUP)    { if (oct < 2) oct++; topDirty = 1; }
 		if (kDown & KEY_DDOWN)  { if (oct > -2) oct--; topDirty = 1; }
 		if (kDown & KEY_Y)      { patchIdx = (patchIdx + 1) % NPATCH; dirty = topDirty = 1; }
-		if (express) {
+		if (joy) {
+			if (kDown & KEY_A) { jScale = (jScale + 1) % 10; dirty = topDirty = 1; }
+			if (kDown & KEY_B) { jBass = (jBass + 1) % 3; topDirty = 1; }
+			if (kDown & KEY_X) { jStrum = (jStrum + 1) % 4; topDirty = 1; }
+			if (kDown & KEY_R) { jMap = (jMap + 1) % MAP_COUNT; topDirty = 1; }
+			if (kDown & KEY_L) { if (jLock >= 0) jLock = -1; else jLock = jDir; topDirty = 1; }
+		} else if (express) {
 			if (kDown & KEY_A) { xset = (xset + 1) % NXSET; dirty = topDirty = 1; }
 			if (kDown & KEY_B) { xset = (xset + NXSET - 1) % NXSET; dirty = topDirty = 1; }
 		} else {
@@ -617,7 +870,8 @@ int main(void) {
 			activePad = -1; xPad = -1; curN = 0; strcpy(chordName, "-"); roman[0] = 0;
 			bendSemis = 0; exprTarget = exprGain = 1.0f;
 			exprFilter = (mode == M_EXPRESS);
-			express = (mode == M_EXPRESS);
+			express = (mode == M_EXPRESS); joy = (mode == M_JOY);
+			jDeg = -1; jHeld = 0; jLock = -1; jPrevEff = -2; jInPlate = 0;
 			dirty = topDirty = 1;
 		}
 
@@ -625,7 +879,7 @@ int main(void) {
 		float cy = cp.dy / 156.0f, cx = cp.dx / 156.0f;
 		if (fabsf(cy) < 0.08f) cy = 0;
 		if (fabsf(cx) < 0.08f) cx = 0;
-		cutoffMul = powf(2.0f, cy * 2.5f);
+		cutoffMul = joy ? 1.0f : powf(2.0f, cy * 2.5f);
 
 		// touch
 		touchPosition t; int touching = !!(kHeld & KEY_TOUCH);
@@ -634,7 +888,66 @@ int main(void) {
 		int touchPad = -1;
 		if (touching && t.py < 200) touchPad = (t.py / ph) * 4 + (t.px / 80);
 
-		if (express) {
+		if (joy) {
+			bendSemis = 0;
+			// circle pad = 8-way chord modifier
+			jDir = -1;
+			if (cx * cx + cy * cy > 0.25f) {
+				float a = atan2f(cx, cy); if (a < 0) a += TWO_PI;           // 0 = up, clockwise
+				jDir = ((int)floorf((a + TWO_PI / 16.0f) / (TWO_PI / 8.0f))) & 7;
+			}
+			int eff = jLock >= 0 ? jLock : jDir;
+
+			int padHit = -1, plateHit = -1;
+			if (touching && t.py < JPAD_H) padHit = t.px * 7 / 320;
+			if (touching && t.py >= PLATE_Y && t.py < PLATE_Y + PLATE_H) {
+				int sIdx = (t.px - 10 + 10) / 20; if (sIdx < 0) sIdx = 0;
+				if (sIdx > NSTRINGS - 1) sIdx = NSTRINGS - 1;
+				plateHit = sIdx;
+			}
+
+			int play = 0;
+			if (padHit >= 0 && (!jHeld || padHit != jDeg)) { jDeg = padHit; jHeld = 1; play = 1; }
+			if (jHeld && padHit < 0) { releaseTag(1); jHeld = 0; dirty = 1; }
+			if (eff != jPrevEff) { if (jHeld) play = 1; topDirty = 1; }
+
+			int deg = jDeg >= 0 ? jDeg : 0;
+			JChord jc; joyBuild(&jc, jScale, deg, jMap, eff);
+			if (play || eff != jPrevEff) {
+				joyName(&jc, key, chordName, sizeof(chordName));
+				if (eff >= 0) snprintf(roman, sizeof(roman), "%s%s", DIR_LABELS[jMap][eff], jLock >= 0 ? " *" : "");
+				else roman[0] = 0;
+			}
+			if (play) {
+				curN = joyVoice(&jc, key, oct, jBass, curNotes);
+				releaseTag(1);
+				int step = (int)(STRUM_SEC[jStrum] * SR);
+				for (int i = 0; i < curN; i++) noteOn(curNotes[i], i * step, 1.0f);
+				dirty = topDirty = 1;
+			}
+			jPrevEff = eff;
+
+			// strum plate strings follow the current chord (+ modifier)
+			int ns2[NSTRINGS]; int n2 = joyStrings(&jc, key, oct, ns2);
+			if (n2 != jNs || memcmp(ns2, jStrings, sizeof(int) * n2)) { memcpy(jStrings, ns2, sizeof(ns2)); jNs = n2; jPlateDirty = 1; }
+
+			if (plateHit >= 0 && plateHit < jNs) {
+				float vel = 0.55f + 0.45f * (1.0f - (t.py - PLATE_Y) / (float)PLATE_H);
+				int list[NSTRINGS], cnt = 0;
+				if (!jInPlate || jPrevString < 0) list[cnt++] = plateHit;                       // new touch
+				else if (plateHit > jPrevString) for (int i = jPrevString + 1; i <= plateHit; i++) list[cnt++] = i; // swipe right
+				else if (plateHit < jPrevString) for (int i = jPrevString - 1; i >= plateHit; i--) list[cnt++] = i; // swipe left
+				for (int k = 0; k < cnt; k++) {
+					if (list[k] >= jNs) continue;
+					Voice* v = noteOn(jStrings[list[k]], k * (int)(0.004f * SR), vel);
+					v->tag = 2; v->gate = (int)(0.9f * SR) + k * (int)(0.004f * SR);
+					jFlash[list[k]] = 10; jPlateDirty = 1;
+				}
+				jInPlate = 1; jPrevString = plateHit;
+			} else { jInPlate = 0; jPrevString = -1; }
+			for (int i = 0; i < NSTRINGS; i++) if (jFlash[i] > 0) { jFlash[i]--; jPlateDirty = 1; }
+			activePad = jHeld ? jDeg : -1;
+		} else if (express) {
 			// circle pad left/right = inversion
 			int inv = (int)roundf(cx * 2.4f);
 			if (inv > 2) inv = 2;
@@ -753,8 +1066,19 @@ int main(void) {
 
 		// top screen
 		if (topDirty) {
-			drawTopInfo(audioOK, mode, key, minor, oct, voicing, xset, xinv, chordName,
-				roman, curNotes, curN);
+			char r1[64], r2[64];
+			if (joy) {
+				snprintf(r1, sizeof(r1), "KEY %s %s  OCT %+d  BASS %s", NOTE_NAMES[key], SCALE_NAMES[jScale], oct, BASS_NAMES[jBass]);
+				snprintf(r2, sizeof(r2), "STICK %s  STRUM %s  %s  %s", MAP_NAMES[jMap], STRUM_NAMES[jStrum],
+					jLock >= 0 ? "LOCKED" : "", PATCHES[patchIdx].name);
+			} else if (express) {
+				snprintf(r1, sizeof(r1), "SET %s  TRANSPOSE %+d  OCT %+d  INV %+d", XSETS[xset].name, key > 5 ? key - 12 : key, oct, xinv);
+				snprintf(r2, sizeof(r2), "SOUND: %s", PATCHES[patchIdx].name);
+			} else {
+				snprintf(r1, sizeof(r1), "KEY %s %s  OCT %+d  %s", NOTE_NAMES[key], minor ? "MIN" : "MAJ", oct, VOICING_NAMES[voicing]);
+				snprintf(r2, sizeof(r2), "SOUND: %s", PATCHES[patchIdx].name);
+			}
+			drawTopInfo(audioOK, mode, chordName, roman, curNotes, curN, r1, r2);
 			memset(kbPrev, 0xff, sizeof(kbPrev)); // force keyboard redraw
 			topDirty = 0;
 		}
@@ -769,6 +1093,14 @@ int main(void) {
 		}
 
 		// bottom screen
+		if (joy && (dirty || jPlateDirty)) {
+			if (dirty) {
+				char status[48];
+				snprintf(status, sizeof(status), "%s %s  %s", NOTE_NAMES[key], SCALE_NAMES[jScale], MAP_NAMES[jMap]);
+				drawJoyBottom(key, jScale, activePad, jStrings, jNs, jFlash, status, "STICK:mod L:lock R:map A:scale B:bass");
+			} else drawPlate(jStrings, jNs, jFlash);
+			dirty = 0; jPlateDirty = 0;
+		}
 		if (dirty) {
 			char status[48], hint[48];
 			if (express) {
