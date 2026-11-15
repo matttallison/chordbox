@@ -31,9 +31,9 @@ include $(DEVKITARM)/3ds_rules
 #     - icon.png
 #     - <libctru folder>/default_icon.png
 #---------------------------------------------------------------------------------
-TARGET		:=	phototape
-APP_TITLE	:=	PhotoTape
-APP_DESCRIPTION	:=	Every photo is a synth patch
+TARGET		:=	padbox
+APP_TITLE	:=	PadBox
+APP_DESCRIPTION	:=	Mini MPC-style sampler
 APP_AUTHOR	:=	Soul Provider Records
 BUILD		:=	build
 SOURCES		:=	source

@@ -1,4 +1,4 @@
-name: Build PhotoTape
+name: Build PadBox
 
 on:
   push:
@@ -32,28 +32,28 @@ jobs:
           {
             make &&
             bannertool makebanner -i app/banner.png -a app/BannerAudio.wav -o build/banner.bin &&
-            bannertool makesmdh -s "PhotoTape" -l "Every photo is a synth patch" -p "Soul Provider Records" -i app/icon.png -o build/icon.bin &&
-            makerom -f cia -target t -o phototape.cia -elf phototape.elf -rsf app/phototape.rsf -banner build/banner.bin -icon build/icon.bin
+            bannertool makesmdh -s "PadBox" -l "Mini MPC-style sampler" -p "Soul Provider Records" -i app/icon.png -o build/icon.bin &&
+            makerom -f cia -target t -o padbox.cia -elf padbox.elf -rsf app/padbox.rsf -banner build/banner.bin -icon build/icon.bin
           } 2>&1 | tee build.log
 
       - name: Upload build artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: phototape
+          name: padbox
           path: |
-            phototape.3dsx
-            phototape.cia
+            padbox.3dsx
+            padbox.cia
             build.log
 
-      - name: Publish to "phototape" release (QR / phone download)
+      - name: Publish to "padbox" release (QR / phone download)
         if: always()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: phototape
-          name: PhotoTape (latest build)
+          tag_name: padbox
+          name: PadBox (latest build)
           make_latest: false
           files: |
-            phototape.3dsx
-            phototape.cia
+            padbox.3dsx
+            padbox.cia
             build.log

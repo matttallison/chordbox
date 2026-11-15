@@ -1,12 +1,12 @@
 BasicInfo:
-  Title                   : "PhotoTape"
-  ProductCode             : "CTR-H-PTAP"
+  Title                   : "PadBox"
+  ProductCode             : "CTR-H-PDBX"
   Logo                    : Homebrew # Nintendo / Licensed / Distributed / iQue / iQueForSystem
 
 
 TitleInfo:
   Category                : Application
-  UniqueId                : 0xC40B6
+  UniqueId                : 0xC40B7
 
 Option:
   UseOnSD                 : true # true if App is to be installed to SD

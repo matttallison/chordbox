@@ -1,1078 +1,811 @@
-// PhotoTape - every photo is a synth patch. Nintendo 2DS / 3DS homebrew (libctru)
+// PadBox - mini MPC-style sampling drum machine for Nintendo 2DS / 3DS (homebrew, libctru)
 //
-// Snap a photo with the camera. The picture becomes:
-//   * a TAPE  - the image rendered to audio (SPECTRAL / WAVE / SCAN), played by a tape looper
-//   * GRAINS  - a granular cloud scrubbing through the tape (or your mic sample)
-//   * DRUMS   - kick / snare / hat tuned from the photo's colour + contrast, PERC = a slice of the tape
-//   * SYNTH   - 64 wavetables cut from the photo's columns, envelope + filter from its look
-//   * a SCALE - root note from the dominant hue, mode from brightness + warmth
-// A 7-track, 16-step sequencer plays it all. The MIC page records samples with a basic editor.
+// Bottom screen: 16 velocity pads (4 banks A-D = 64 pads), page tabs, bank / BTN / 16 LEVELS toggles.
+// Top screen: the "LCD" for the current page: MAIN  PROG  STEP  SMPL  CHOP  DISK.
 //
-// Pages (SELECT or tap the tabs): CAM  TAPE  GRAIN  SEQ  MIC  KEYS
-// START = play / stop sequencer.   Hold SELECT + press START = quit.
-// Files live in sdmc:/3ds/phototape  (P####.bmp photo, P####.pat patch, S####.wav samples)
+// Global controls
+//   START ........ play / stop             SELECT ..... next page   (SELECT+START quits)
+//   A ............ REC (overdub) on/off    X .......... undo / redo last record pass or erase
+//   B (hold)+pad . erase that pad from the sequence      L+B ... clear the whole sequence
+//   Y ............ FULL LEVEL on/off (off = touch height sets velocity)
+//   R (hold)+pad . NOTE REPEAT at the QUANT rate (records when REC is on)
+//   L (hold)+pad . select a pad without playing it     L+Y ... 16 LEVELS   L+X ... tap tempo
+//   L+A .......... metronome on/off        L+D-pad up/down .. bank
+//   D-pad ........ up/down = field, left/right = value (hold L + left/right for big steps)
+//   Circle pad ... DJ filter on the master (down = low-pass, up = high-pass)
+// BTN mode (tap BTN): D-pad + Y B A X + L play pads 1-9 with your thumbs, SELECT = REC.
+//
+// Files: sdmc:/3ds/padbox/  (samples/ for WAVs, projects/Pnn/ for saved projects)
 
 #include <3ds.h>
 #include <math.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <stdlib.h>
 #include <malloc.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
 #define SR          32000
-#define BUF_SAMPLES 512
+#define BUF_SAMPLES 256
 #define NBUFS       4
-#define PW          400
-#define PH          240
-#define TAPE_MAX    (SR * 6)
-#define SMP_MAX     (SR * 6)
+#define NBANKS      4
+#define NPADS       64
+#define MAXSMP      128
+#define MAXVOX      16
+#define NSEQ        16
+#define MAXEV       4096
+#define PPQ         960
+#define TPB         (PPQ * 4)
+#define POOL_LIMIT  (28 * 1024 * 1024)
 #define MIC_RATE    32730.0f
-#define RAW_MAX     (32730 * 6)
-#define NTAB        64
-#define TABN        256
-#define NTR         7
-#define NSTEP       16
-#define MAXGR       40
-#define NSYN        4
-#define NSMPV       4
-#define PT_DIR      "sdmc:/3ds/phototape"
-#define TWO_PI_F    6.28318530718f
+#define PB_DIR      "sdmc:/3ds/padbox"
+#define PI_F        3.14159265f
 
-static inline float clampf(float x, float a, float b) { return x < a ? a : (x > b ? b : x); }
+// ================================================================ samples
+typedef struct { s16* d; int len; char name[16]; } Sample;
+static Sample smp[MAXSMP];
+static int poolBytes = 0;
 
-// ---------------------------------------------------------------- random / tables
-static u32 rngMain = 0x2545F491, rngAud = 0x9E3779B9;
-static inline float frandM(void) { rngMain = rngMain * 1664525u + 1013904223u; return (rngMain >> 8) * (1.0f / 16777216.0f); }
-static inline float frandA(void) { rngAud = rngAud * 1664525u + 1013904223u; return (rngAud >> 8) * (1.0f / 16777216.0f); }
-static inline float nrandA(void) { return frandA() * 2.0f - 1.0f; }
-
-static float sinT[4097];
-static float hannT[1025];
-static inline float fsin(float ph) {   // sin(2*pi*ph), ph >= 0
-	float p = ph * 4096.0f; int i = (int)p; float f = p - i; i &= 4095;
-	return sinT[i] + (sinT[i + 1] - sinT[i]) * f;
+static int smpAlloc(int len, const char* name) {
+	if (len < 2) return -1;
+	if (poolBytes + len * 2 > POOL_LIMIT) return -1;
+	for (int i = 0; i < MAXSMP; i++) if (!smp[i].d) {
+		smp[i].d = (s16*)malloc(len * 2);
+		if (!smp[i].d) return -1;
+		smp[i].len = len; poolBytes += len * 2;
+		snprintf(smp[i].name, sizeof(smp[i].name), "%s", name);
+		return i;
+	}
+	return -1;
 }
-static inline float softclip(float x) {
-	if (x > 3.0f) return 1.0f; if (x < -3.0f) return -1.0f;
-	return x * (27.0f + x * x) / (27.0f + 9.0f * x * x);
+static void smpFreeSlot(int i) {
+	if (i < 0 || i >= MAXSMP || !smp[i].d) return;
+	free(smp[i].d); poolBytes -= smp[i].len * 2;
+	smp[i].d = NULL; smp[i].len = 0; smp[i].name[0] = 0;
 }
-static inline float mtof(float m) { return 440.0f * powf(2.0f, (m - 69.0f) / 12.0f); }
 
-// ---------------------------------------------------------------- scales
-typedef struct { const char* name; int n; int iv[7]; } Scale;
-static const Scale SCALES[8] = {
-	{"PHRYGIAN", 7, {0,1,3,5,7,8,10}},
-	{"HARM MIN", 7, {0,2,3,5,7,8,11}},
-	{"MINOR",    7, {0,2,3,5,7,8,10}},
-	{"DORIAN",   7, {0,2,3,5,7,9,10}},
-	{"PENT MIN", 5, {0,3,5,7,10}},
-	{"MIXOLYD",  7, {0,2,4,5,7,9,10}},
-	{"PENT MAJ", 5, {0,2,4,7,9}},
-	{"LYDIAN",   7, {0,2,4,6,7,9,11}},
-};
-static const char* NOTE_NAMES[12] = {"C","C#","D","Eb","E","F","F#","G","Ab","A","Bb","B"};
-
-// ---------------------------------------------------------------- the patch (derived from the photo)
+// ================================================================ pads
 typedef struct {
-	float r, g, b, lum, contrast, sat, hue, edge;
-	int root, scale;
-	float kickF0, kickF1, kickPD, kickAD, kickClick;
-	float snTone, snNoise, snDecay, snBP;
-	float hatBase, hatDecay;
-	int percCol; float percDecay;
-	float synA, synD, synS, synR, synCut, synRes, synEnv, synScan, synMove;
-} Patch;
-static Patch P;
+	s16 smp;            // sample slot or -1
+	int start, end;     // region in samples
+	s8 tune, fine;      // semitones, cents
+	u8 level;           // 0-100
+	s8 pan;             // -50..50
+	u8 attack, decay;   // 0-100 (decay 100 = off)
+	u8 mode;            // 0 one shot, 1 note on
+	u8 mgroup;          // 0 off, 1-8
+	u8 cutoff, reso;    // 0-100 (cutoff 100 = open)
+	u8 reverse;
+} Pad;
+static Pad pads[NPADS];
 
-static inline int degSemi(int d) {
-	int n = SCALES[P.scale].n;
-	int o = d >= 0 ? d / n : -((-d + n - 1) / n);
-	return o * 12 + SCALES[P.scale].iv[d - o * n];
+static void padReset(Pad* p) {
+	memset(p, 0, sizeof(*p));
+	p->smp = -1; p->level = 80; p->decay = 100; p->cutoff = 100;
+}
+static void padAssign(int pi, int s) {
+	Pad* p = &pads[pi];
+	p->smp = s; p->start = 0; p->end = (s >= 0) ? smp[s].len : 0;
+}
+static const char* padSmpName(int pi) {
+	int s = pads[pi].smp;
+	return (s >= 0 && smp[s].d) ? smp[s].name : "";
 }
 
-// ---------------------------------------------------------------- buffers
-static u8 photo[PH][PW][3];
-static u8 luma[PH][PW];
-static u8* topCache;                 // photo pre-rotated in top framebuffer layout
-static u8* topDim;                   // same, darkened for overlay pages
-static u8 stripCache[80][320][3];    // photo squashed to the bottom-screen tape strip
-static float* wtab;                  // NTAB * TABN wavetables from photo columns
-static s16* tape; static volatile int tapeLen = 0;
-static s16* smp;  static s16* smpUndo;
-static volatile int smpLen = 0, smpS = 0, smpE = 0;
-static int smpUndoLen = 0, smpUndoS = 0, smpUndoE = 0, haveUndo = 0;
-static s16* rawMic; static int rawLen = 0;
-static u8 tapePeak[320], smpPeak[400];
-static int photoId = 0;              // 0 = built-in picture
+// ================================================================ voices
+typedef struct {
+	int on, pad, s, holdId;
+	const s16* d;
+	int pos, start, end, dir, played;
+	float frac, step;
+	float gl, gr;
+	float env, att, dec, rel;
+	int stage;           // 0 attack, 1 body, 2 release
+	int noteOn, decOn, gate;
+	int filt; float a1, a2, a3, k, ic1, ic2;
+	u32 age;
+} Voice;
+static Voice vox[MAXVOX];
+static u32 voxAge = 0;
+static volatile u8 hitFlag[NPADS];   // set by audio, read by UI for pad flashes
 
-// ---------------------------------------------------------------- shared engine state
-enum { T_KICK, T_SNARE, T_HAT, T_PERC, T_SYNTH, T_GRAIN, T_SAMPLE };
-static const char* TR_SHORT[NTR] = {"KCK","SNR","HAT","PRC","SYN","GRN","SMP"};
-static const char* TR_LONG[NTR]  = {"KICK","SNARE","HAT","PERC","SYNTH","GRAIN","SAMPLE"};
-static const u8 TR_COL[NTR][3] = {
-	{235,90,60},{240,170,60},{230,220,90},{120,210,110},{80,170,240},{170,120,240},{240,110,190}
-};
-typedef struct { u8 on; s8 val; } Step;
-static Step seq[NTR][NSTEP];
-static float trTune[NTR], trDecay[NTR];
-static u8 trMute[NTR];
-static volatile int tempo = 96;
-static volatile float swing = 0.0f;
-static volatile int playing = 0, curStep = -1, seqResetReq = 0;
-static volatile float stepFrac = 0.0f;
-
-static float tp[6] = {0.5f, 0.15f, 0.3f, 0.1f, 0.75f, 0.8f};   // SPEED WOW DRIVE HISS TONE LEVEL
-static float gp[6] = {0.35f, 0.45f, 0.25f, 0.5f, 0.0f, 0.7f};  // SIZE DENS SPRAY PITCH REV LEVEL
-static const char* TP_NAMES[6] = {"SPEED","WOW","DRIVE","HISS","TONE","LEVEL"};
-static const char* GP_NAMES[6] = {"SIZE","DENS","SPRAY","PITCH","REV","LEVEL"};
-static volatile int tapeRun = 0, tapeDir = 1, tapeSync = 0;
-static volatile float loopS = 0.0f, loopE = 1.0f, tapeJumpReq = -1.0f, tapePosFrac = 0.0f;
-static const int SYNC_BARS[4] = {0, 1, 2, 4};
-static volatile int grainSrc = 0, grainTouch = 0, grainLatch = 0;
-static volatile float grainPos = 0.5f;
-static float grainVisPos[MAXGR]; static volatile int grainVisOn[MAXGR];
-static volatile int holdReq = 0, holdAck = 0;
-static int audioOK = 0;
-enum { TM_SPECTRAL, TM_WAVE, TM_SCAN, TM_MIC, TM_COUNT };
-static const char* TM_NAMES[TM_COUNT] = {"SPECTRAL","WAVE","SCAN","MIC"};
-static int tapeMode = TM_SPECTRAL;
-
-// events main -> audio (single producer / single consumer)
-enum { EV_DRUM, EV_SYN_ON, EV_SYN_OFF, EV_GRAIN_ON, EV_GRAIN_OFF, EV_SMP };
-typedef struct { u8 type, tr; s8 val; } Ev;
-static Ev evq[64]; static volatile int evW = 0, evR = 0;
-static void pushEv(int type, int tr, int val) {
-	int n = (evW + 1) & 63; if (n == evR) return;
-	evq[evW].type = type; evq[evW].tr = tr; evq[evW].val = val;
-	__sync_synchronize(); evW = n;
-}
-
-// ---------------------------------------------------------------- voices
-typedef struct { int on; float ph, env, penv, cenv, vel, f0, f1, pdk, adk; } Kick;
-typedef struct { int on; float ph, f, tenv, nenv, tdk, ndk, vel, lp, bp, bf, mix; } Snare;
-typedef struct { int on; float ph[6], f, env, dk, vel, h1, x1, h2, x2; } Hat;
-typedef struct { int on; float pos, inc, env, dk, vel; } Perc;
-typedef struct { int on, stage, note, gate; float freq, ph, env, wpos, wdir, lp, bp, vel; u32 age; } SynV;
-typedef struct { int on, age, len, src, rs, re; float pos, inc, amp, pl, pr; } Grain;
-typedef struct { int on; float pos, inc, env, dk, end, vel; } SmpV;
-
-static Kick kick; static Snare snare; static Hat hat; static Perc perc;
-static SynV syn[NSYN]; static Grain grains[MAXGR]; static SmpV smpv[NSMPV];
-static u32 synAge = 0;
-static int burstLeft = 0, burstSemi = 0, keysGrain = 0, keysSemi = 0;
-static float grainTimer = 0;
-static double tapePosD = 0; static float tapeMul = 0, wowPh = 0, flutPh = 0, toneLP = 0;
-static float stepCountdown = 0, stepLen = 1; static int stepIdx = -1;
-
-static float tuneMul(int tr, float oct) { return powf(2.0f, (trTune[tr] - 0.5f) * 2.0f * oct); }
-static float decMul(int tr) { return powf(2.0f, (trDecay[tr] - 0.5f) * 3.0f); }
-
-static void trigKick(float vel) {
-	float tm = tuneMul(T_KICK, 1.0f);
-	kick.on = 1; kick.env = 1; kick.penv = 1; kick.cenv = 1; kick.ph = 0; kick.vel = vel;
-	kick.f0 = P.kickF0 * tm; kick.f1 = P.kickF1 * tm;
-	kick.pdk = expf(-1.0f / (SR * P.kickPD));
-	kick.adk = expf(-1.0f / (SR * P.kickAD * decMul(T_KICK)));
-}
-static void trigSnare(float vel) {
-	float tm = tuneMul(T_SNARE, 1.0f), dm = decMul(T_SNARE);
-	snare.on = 1; snare.vel = vel; snare.ph = 0; snare.f = P.snTone * tm;
-	snare.tenv = 1; snare.nenv = 1; snare.mix = P.snNoise;
-	snare.tdk = expf(-1.0f / (SR * P.snDecay * 0.5f * dm));
-	snare.ndk = expf(-1.0f / (SR * P.snDecay * dm));
-	snare.bf = 2.0f * sinf(3.14159f * clampf(P.snBP * tm, 200, 5000) / SR);
-}
-static void trigHat(float vel) {
-	hat.on = 1; hat.vel = vel; hat.env = 1; hat.f = P.hatBase * tuneMul(T_HAT, 1.0f);
-	hat.dk = expf(-1.0f / (SR * P.hatDecay * decMul(T_HAT)));
-}
-static void trigPerc(float vel) {
-	if (tapeLen < 1000) return;
-	perc.on = 1; perc.vel = vel; perc.env = 1;
-	perc.pos = (float)P.percCol / PW * (tapeLen - 1);
-	perc.inc = tuneMul(T_PERC, 1.0f);
-	perc.dk = expf(-1.0f / (SR * P.percDecay * decMul(T_PERC)));
-}
-static void synOn(int deg, int gate, float vel) {
-	int vi = -1; u32 oldest = 0xffffffff;
-	for (int i = 0; i < NSYN; i++) if (!syn[i].on) { vi = i; break; }
-	if (vi < 0) for (int i = 0; i < NSYN; i++) if (syn[i].age < oldest) { oldest = syn[i].age; vi = i; }
-	SynV* v = &syn[vi];
-	if (!v->on) { v->env = 0; v->lp = v->bp = 0; v->ph = frandA(); }
-	v->on = 1; v->stage = 0; v->note = deg; v->gate = gate; v->vel = vel; v->age = ++synAge;
-	v->freq = mtof(48 + P.root + degSemi(deg));
-	float w = P.synScan * (NTAB - 1) + (trTune[T_SYNTH] - 0.5f) * NTAB;
-	while (w < 0) w += NTAB - 1;
-	while (w > NTAB - 1) w -= NTAB - 1;
-	v->wpos = w; v->wdir = 1;
-}
-static void synOff(int deg) {
-	for (int i = 0; i < NSYN; i++) if (syn[i].on && syn[i].note == deg && syn[i].gate < 0) syn[i].stage = 3;
-}
-static void smpOn(int semi, float vel) {
-	if (smpE - smpS < 64) return;
-	int vi = 0; float best = 2;
-	for (int i = 0; i < NSMPV; i++) { if (!smpv[i].on) { vi = i; best = -1; break; } if (smpv[i].env < best) { best = smpv[i].env; vi = i; } }
-	SmpV* v = &smpv[vi];
-	v->on = 1; v->pos = smpS; v->end = smpE; v->env = 1; v->vel = vel;
-	v->inc = powf(2.0f, semi / 12.0f) * tuneMul(T_SAMPLE, 1.0f);
-	v->dk = trDecay[T_SAMPLE] > 0.95f ? 1.0f : expf(-1.0f / (SR * (0.03f + trDecay[T_SAMPLE] * 1.5f)));
-}
-
-static void trigger(int tr, int val, int gate) {
-	float vel = 0.2f + 0.8f * clampf(val, 0, 15) / 15.0f;
-	switch (tr) {
-	case T_KICK:  trigKick(vel); break;
-	case T_SNARE: trigSnare(vel); break;
-	case T_HAT:   trigHat(vel); break;
-	case T_PERC:  trigPerc(vel); break;
-	case T_SYNTH: synOn(val, gate, 0.9f); break;
-	case T_GRAIN: burstLeft = gate + SR / 20; burstSemi = degSemi(val); grainTimer = 0; break;
-	case T_SAMPLE: smpOn(degSemi(val), 0.9f); break;
+static void voiceCutGroup(int g) {
+	for (int i = 0; i < MAXVOX; i++) {
+		Voice* v = &vox[i];
+		if (v->on && pads[v->pad].mgroup == g) { v->stage = 2; v->rel = 0.993f; }
 	}
 }
 
-static void spawnGrain(int semi) {
-	int gi = -1;
-	for (int i = 0; i < MAXGR; i++) if (!grains[i].on) { gi = i; break; }
-	if (gi < 0) return;
-	Grain* g = &grains[gi];
-	int src = 0, rs = 0, re = tapeLen;
-	if (grainSrc == 1 && smpE - smpS > 512) { src = 1; rs = smpS; re = smpE; }
-	int rl = re - rs; if (rl < 512) return;
-	float spray = gp[2];
-	float c = rs + grainPos * rl + spray * nrandA() * rl * 0.25f;
-	while (c < rs) c += rl;
-	while (c >= re) c -= rl;
-	g->src = src; g->rs = rs; g->re = re; g->pos = c; g->age = 0;
-	g->len = (int)(SR * 0.01f * powf(2.0f, gp[0] * 6.0f));
-	g->inc = powf(2.0f, (roundf((gp[3] - 0.5f) * 48.0f) + semi) / 12.0f);
-	if (frandA() < gp[4]) g->inc = -g->inc;
-	float pan = clampf(0.5f + nrandA() * spray * 0.5f, 0, 1);
-	g->pl = sqrtf(1 - pan); g->pr = sqrtf(pan);
-	g->amp = gp[5] * 0.55f; g->on = 1;
-	grainVisPos[gi] = (c - rs) / rl; grainVisOn[gi] = 1;
-}
-
-static void processEvents(void) {
-	while (evR != evW) {
-		Ev e = evq[evR]; evR = (evR + 1) & 63;
-		switch (e.type) {
-		case EV_DRUM: trigger(e.tr, e.val, SR / 8); break;
-		case EV_SYN_ON: synOn(e.val, -1, 0.9f); break;
-		case EV_SYN_OFF: synOff(e.val); break;
-		case EV_GRAIN_ON: keysGrain = 1; keysSemi = degSemi(e.val); grainTimer = 0; break;
-		case EV_GRAIN_OFF: keysGrain = 0; break;
-		case EV_SMP: smpOn(degSemi(e.val), 0.9f); break;
+static void voiceStart(int pad, int trans, int vel, int gate, int holdId) {
+	Pad* p = &pads[pad];
+	if (p->smp < 0 || !smp[p->smp].d) return;
+	Sample* S = &smp[p->smp];
+	int st = p->start, en = p->end;
+	if (en > S->len) en = S->len;
+	if (st < 0) st = 0;
+	if (en - st < 4) return;
+	if (p->mgroup) voiceCutGroup(p->mgroup);
+	Voice* v = NULL;
+	for (int i = 0; i < MAXVOX; i++) if (!vox[i].on) { v = &vox[i]; break; }
+	if (!v) {   // steal: prefer releasing, then oldest
+		u32 best = 0xffffffff;
+		for (int i = 0; i < MAXVOX; i++) {
+			u32 a = vox[i].age - (vox[i].stage == 2 ? 0x40000000u : 0);
+			if (a < best) { best = a; v = &vox[i]; }
 		}
 	}
+	memset(v, 0, sizeof(*v));
+	v->on = 1; v->pad = pad; v->s = p->smp; v->d = S->d; v->holdId = holdId;
+	v->start = st; v->end = en;
+	v->dir = p->reverse ? -1 : 1;
+	v->pos = p->reverse ? en - 1 : st;
+	v->step = powf(2.0f, (p->tune + trans + p->fine / 100.0f) / 12.0f);
+	float g = (p->level / 100.0f) * (p->level / 100.0f) * 1.6f * (vel / 127.0f);
+	float ang = (p->pan + 50) / 100.0f * (PI_F / 2);
+	v->gl = g * cosf(ang) * 1.414f; v->gr = g * sinf(ang) * 1.414f;
+	if (p->attack) { v->stage = 0; v->env = 0; v->att = 1.0f / (p->attack / 100.0f * p->attack / 100.0f * SR + 1); }
+	else { v->stage = 1; v->env = 1; }
+	v->decOn = p->decay < 100;
+	float dt = 0.02f * powf(250.0f, p->decay / 99.0f);
+	v->dec = expf(-1.0f / (dt * SR));
+	v->noteOn = p->mode == 1;
+	v->gate = gate;
+	v->rel = v->decOn ? v->dec : 0.997f;
+	if (p->cutoff < 100) {
+		float fc = 40.0f * powf(2.0f, p->cutoff / 100.0f * 8.6f);
+		if (fc > 14000) fc = 14000;
+		float gg = tanf(PI_F * fc / SR);
+		v->k = 2.0f - 2.0f * (p->reso / 100.0f) * 0.96f;
+		v->a1 = 1.0f / (1.0f + gg * (gg + v->k)); v->a2 = gg * v->a1; v->a3 = gg * v->a2;
+		v->filt = 1;
+	}
+	v->age = ++voxAge;
+	hitFlag[pad] = vel ? vel : 1;
 }
 
-static void fireStep(int s, float sps) {
-	for (int tr = 0; tr < NTR; tr++)
-		if (seq[tr][s].on && !trMute[tr]) trigger(tr, seq[tr][s].val, (int)(sps * 0.85f));
+static void voiceReleaseHold(int holdId) {
+	for (int i = 0; i < MAXVOX; i++)
+		if (vox[i].on && vox[i].holdId == holdId && vox[i].noteOn && vox[i].stage != 2) vox[i].stage = 2;
+}
+static void voicesKillSample(int s) {
+	for (int i = 0; i < MAXVOX; i++) if (vox[i].s == s) vox[i].on = 0;
+}
+
+// ================================================================ sequencer data
+typedef struct { u32 tick; u16 len; u8 pad; u8 vel; s8 trans; u8 flags; } Event;
+#define EVF_SKIP 1
+static Event seqEv[NSEQ][MAXEV];
+static int seqN[NSEQ];
+static u8 seqBars[NSEQ];
+static Event undoEv[MAXEV]; static int undoN = -1, undoSeq = 0, undoBars = 1;
+
+static int bpmX10 = 900, swing = 50, quantSel = 4, metroSel = 0, countIn = 1, vintage = 0, masterVol = 80, fullLevel = 1;
+static int curSeq = 0;
+static const char* QUANT_NAMES[7] = {"OFF","1/4","1/8","1/8T","1/16","1/16T","1/32"};
+static const int QUANT_TICKS[7] = {0, 960, 480, 320, 240, 160, 120};
+static const char* VINT_NAMES[4] = {"CLEAN","MPC60","SP-1200","LOFI"};
+static const char* METRO_NAMES[3] = {"OFF","ON","REC ONLY"};
+
+static int seqLen(void) { return seqBars[curSeq] * TPB; }
+
+static volatile int playState = 0;     // 0 stop, 1 count-in, 2 play
+static volatile int recOn = 0;
+static double songTick = 0, ciTick = 0, freeTick = 0;
+static int lastTick = -1, lastFree = -1, evIdx = 0;
+static LightLock alock;
+
+static int lowerBound(int sq, u32 t) {
+	int lo = 0, hi = seqN[sq];
+	while (lo < hi) { int m = (lo + hi) / 2; if (seqEv[sq][m].tick < t) lo = m + 1; else hi = m; }
+	return lo;
+}
+static void seqResync(void) { evIdx = lowerBound(curSeq, (u32)(lastTick + 1)); }
+
+static int evInsert(int sq, u32 tick, int pad, int trans, int vel, int len, int flags) {
+	Event* E = seqEv[sq];
+	int i = lowerBound(sq, tick);
+	for (int j = i; j < seqN[sq] && E[j].tick == tick; j++)
+		if (E[j].pad == pad && E[j].trans == trans) { E[j].vel = vel; E[j].len = len; E[j].flags = flags; return j; }
+	if (seqN[sq] >= MAXEV) return -1;
+	memmove(&E[i + 1], &E[i], (seqN[sq] - i) * sizeof(Event));
+	E[i].tick = tick; E[i].pad = pad; E[i].trans = trans; E[i].vel = vel; E[i].len = len; E[i].flags = flags;
+	seqN[sq]++;
+	if (sq == curSeq && i < evIdx) evIdx++;
+	return i;
+}
+static void evDelete(int sq, int i) {
+	memmove(&seqEv[sq][i], &seqEv[sq][i + 1], (seqN[sq] - i - 1) * sizeof(Event));
+	seqN[sq]--;
+	if (sq == curSeq && i < evIdx) evIdx--;
+}
+static void undoSnap(void) {
+	memcpy(undoEv, seqEv[curSeq], seqN[curSeq] * sizeof(Event));
+	undoN = seqN[curSeq]; undoSeq = curSeq; undoBars = seqBars[curSeq];
+}
+static int undoSwap(void) {
+	if (undoN < 0 || undoSeq != curSeq) return 0;
+	static Event tmp[MAXEV];
+	int n = seqN[curSeq], b = seqBars[curSeq];
+	memcpy(tmp, seqEv[curSeq], n * sizeof(Event));
+	memcpy(seqEv[curSeq], undoEv, undoN * sizeof(Event));
+	seqN[curSeq] = undoN; seqBars[curSeq] = undoBars;
+	memcpy(undoEv, tmp, n * sizeof(Event)); undoN = n; undoBars = b;
+	seqResync();
+	return 1;
+}
+
+// ================================================================ held pads / note repeat
+typedef struct { int on, pad, trans, vel, evTick, pressTick, lastRep; } Hold;
+static Hold hold[16];
+static volatile int repeatOn = 0;
+static int recPassArmed = 0;     // take an undo snapshot at the first note of a record pass
+
+static int repDiv(void) { int d = QUANT_TICKS[quantSel]; return d ? d : 240; }
+static int swingDelay(int t, int div) {
+	if (swing <= 50 || (div != 240 && div != 120)) return 0;
+	if (t % 480 == 240) return (swing - 50) * 240 / 50;
+	return 0;
+}
+
+static void recordHit(int pad, int trans, int vel, int len, Hold* h) {
+	if (!recOn || playState != 2) return;
+	if (recPassArmed) { undoSnap(); recPassArmed = 0; }
+	int L = seqLen();
+	int t = (int)songTick;
+	int div = QUANT_TICKS[quantSel], q = t;
+	if (div) { q = ((t + div / 2) / div) * div; }
+	if (q >= L) q -= L;
+	int ahead = ((q - lastTick) % L + L) % L;
+	int flags = (ahead > 0 && ahead < (div ? div : 1)) ? EVF_SKIP : 0;
+	evInsert(curSeq, q, pad, trans, vel, len, flags);
+	if (h) { h->evTick = q; h->pressTick = t; }
+}
+
+// ================================================================ audio engine
+typedef struct { int due, pad, trans, vel, len; } Pend;
+static Pend pend[64]; static int npend = 0;
+static float metroPh = 0, metroEnv = 0, metroF = 1000;
+static float mfIc1L, mfIc2L, mfIc1R, mfIc2R, mfG = 1, mfK = 1.4f; static volatile float circleY = 0; static float mfPos = 0;
+static float vinHoldL, vinHoldR, vinPh;
+static volatile float meterL = 0;
+
+static float bpm(void) { return bpmX10 / 10.0f; }
+static int ticksToSamples(int t) { return (int)(t * 60.0f * SR / (bpm() * PPQ)); }
+
+static void playEvent(int pad, int trans, int vel, int len) {
+	voiceStart(pad, trans, vel, ticksToSamples(len > 0 ? len : 240), 0);
+}
+
+static void clickMetro(int accent) { metroEnv = 1.0f; metroF = accent ? 1600 : 1050; metroPh = 0; }
+
+static void songTickFn(int t) {
+	int sq = curSeq;
+	Event* E = seqEv[sq];
+	while (evIdx < seqN[sq] && E[evIdx].tick <= (u32)t) {
+		Event* e = &E[evIdx++];
+		if ((int)e->tick < t) continue;
+		if (e->flags & EVF_SKIP) { e->flags &= ~EVF_SKIP; continue; }
+		int d = swingDelay(t, 240);
+		if (d && npend < 64) { Pend* p = &pend[npend++]; p->due = t + d; p->pad = e->pad; p->trans = e->trans; p->vel = e->vel; p->len = e->len; }
+		else playEvent(e->pad, e->trans, e->vel, e->len);
+	}
+	for (int i = 0; i < npend; i++) if (pend[i].due <= t) {
+		playEvent(pend[i].pad, pend[i].trans, pend[i].vel, pend[i].len);
+		pend[i--] = pend[--npend];
+	}
+	if (t % PPQ == 0 && (metroSel == 1 || (metroSel == 2 && recOn))) clickMetro(t % TPB == 0);
+}
+
+static void repeatTick(int t, int song) {
+	if (!repeatOn) return;
+	int div = repDiv();
+	if (t % div) return;
+	for (int k = 0; k < 16; k++) {
+		Hold* h = &hold[k];
+		if (!h->on) continue;
+		int since = t - h->lastRep; if (since < 0) since += 1 << 20;
+		if (since < div / 2) continue;
+		h->lastRep = t;
+		int d = song ? swingDelay(t, div) : 0;
+		if (d && npend < 64) { Pend* p = &pend[npend++]; p->due = t + d; p->pad = h->pad; p->trans = h->trans; p->vel = h->vel; p->len = div / 2; }
+		else voiceStart(h->pad, h->trans, h->vel, ticksToSamples(div / 2), 0);
+		if (song) recordHit(h->pad, h->trans, h->vel, div / 2, NULL);
+	}
+}
+
+static inline float vintageProc(float x, float* hold, int ch) {
+	switch (vintage) {
+	case 1: return floorf(x * 2048.0f) / 2048.0f;                      // MPC60: 12-bit
+	case 2: if (vinPh >= 1.0f) *hold = floorf(x * 2048.0f) / 2048.0f; return *hold;   // SP-1200: 12-bit @ 26 kHz
+	case 3: if (vinPh >= 1.0f) *hold = floorf(x * 128.0f) / 128.0f; return *hold;     // 8-bit @ 11 kHz
+	}
+	(void)ch; return x;
 }
 
 static void fillAudio(s16* out, int n) {
-	if (holdReq) { holdAck = 1; memset(out, 0, n * 4); return; }
-	processEvents();
-
-	// per-buffer constants
-	float sps = SR * 60.0f / tempo / 4.0f;
-	int tl = tapeLen;
-	float speed = powf(2.0f, (tp[0] - 0.5f) * 4.0f);
-	int ls = (int)(loopS * tl), le = (int)(loopE * tl);
-	if (le > tl) le = tl;
-	if (le - ls < 256) { le = ls + 256; if (le > tl) { le = tl; ls = le - 256; if (ls < 0) ls = 0; } }
-	if (tapeSync && tl > 0) speed = (float)(le - ls) / (SYNC_BARS[tapeSync] * 16.0f * sps);
-	float wowD = tp[1] * 0.02f, flutD = tp[1] * 0.004f;
-	float drive = 1.0f + tp[2] * 8.0f, driveComp = 1.0f / powf(drive, 0.6f);
-	float hiss = tp[3] * 0.05f;
-	float toneA = 1.0f - expf(-TWO_PI_F * 400.0f * powf(2.0f, tp[4] * 5.5f) / SR);
-	float tLevel = tp[5];
-	if (tapeJumpReq >= 0) { tapePosD = tapeJumpReq * tl; tapeJumpReq = -1; }
-	if (tl > 0 && (tapePosD < 0 || tapePosD >= tl)) tapePosD = ls;
-	float dens = 2.0f * powf(2.0f, gp[1] * 5.3f);
-	int cloudSemiBase = 0;
-	float ds = decMul(T_SYNTH);
-	float aInc = 1.0f / (SR * P.synA), sdk = 1.0f - expf(-1.0f / (SR * P.synD * ds)), rk = expf(-1.0f / (SR * P.synR * ds));
-	float wspeed = P.synMove * 24.0f / SR;
-	float sq = 1.9f - 1.75f * P.synRes;
+	float tps = bpm() * PPQ / (60.0f * SR);
+	// master DJ filter target
+	float cy = circleY;
+	float tgt = (cy < -0.12f) ? cy : (cy > 0.12f ? cy : 0);
+	mfPos += (tgt - mfPos) * 0.2f;
+	float fc;
+	if (mfPos < 0) fc = 16000.0f * powf(2.0f, mfPos * 7.0f);   // LP: 16k down to ~125 Hz
+	else fc = 20.0f * powf(2.0f, mfPos * 9.0f);                 // HP: 20 Hz up to ~10 kHz
+	if (fc > 14500) fc = 14500;
+	mfG = tanf(PI_F * fc / SR); mfK = 1.2f;
+	float ma1 = 1.0f / (1.0f + mfG * (mfG + mfK)), ma2 = mfG * ma1, ma3 = mfG * ma2;
+	int useMF = fabsf(mfPos) > 0.01f, hp = mfPos > 0;
+	float vinInc = vintage == 2 ? 26040.0f / SR : (vintage == 3 ? 11025.0f / SR : 1.0f);
+	float mv = (masterVol / 100.0f) * 0.55f, pk = 0;
 
 	for (int i = 0; i < n; i++) {
-		// sequencer
-		if (seqResetReq) {
-			seqResetReq = 0; stepCountdown = 0; stepIdx = -1;
-			if (tapeSync && tl > 0) tapePosD = tapeDir > 0 ? ls : le - 1;
+		// ---- clocks
+		freeTick += tps;
+		if (playState == 1) {
+			int before = (int)(ciTick / PPQ); ciTick += tps; int after = (int)(ciTick / PPQ);
+			if (after != before && after < 4) clickMetro(0);
+			if (ciTick >= TPB) { playState = 2; songTick = 0; lastTick = -1; evIdx = 0; npend = 0; }
 		}
-		if (playing) {
-			if (stepCountdown <= 0) {
-				stepIdx = (stepIdx + 1) % NSTEP; curStep = stepIdx;
-				stepLen = sps * (1.0f + ((stepIdx & 1) ? -swing : swing) * 0.66f);
-				stepCountdown += stepLen;
-				if (stepIdx == 0 && tapeSync && tl > 0 && tapeRun) tapePosD = tapeDir > 0 ? ls : le - 1;
-				fireStep(stepIdx, sps);
+		if (playState == 2) {
+			songTick += tps;
+			int L = seqLen();
+			int target = (int)songTick;
+			while (lastTick < target) {
+				lastTick++;
+				if (lastTick >= L) {
+					lastTick -= L; songTick -= L; target -= L; evIdx = 0;
+					for (int j = 0; j < npend; j++) pend[j].due -= L;
+				}
+				songTickFn(lastTick);
+				repeatTick(lastTick, 1);
 			}
-			stepCountdown -= 1.0f;
+		} else {
+			int target = (int)freeTick;
+			while (lastFree < target) { lastFree++; repeatTick(lastFree & ((1 << 20) - 1), 0); }
+			for (int j = 0; j < npend; j++) if (pend[j].due <= (lastFree & ((1 << 20) - 1))) {
+				voiceStart(pend[j].pad, pend[j].trans, pend[j].vel, ticksToSamples(pend[j].len), 0); pend[j--] = pend[--npend];
+			}
 		}
+		if (lastFree > (1 << 20)) { lastFree -= 1 << 20; freeTick -= 1 << 20; }
 
-		float L = 0, R = 0, x;
-
-		// kick
-		if (kick.on) {
-			float f = kick.f1 + (kick.f0 - kick.f1) * kick.penv;
-			kick.ph += f / SR; if (kick.ph >= 1) kick.ph -= 1;
-			x = fsin(kick.ph) * kick.env + nrandA() * kick.cenv * P.kickClick * 0.35f;
-			kick.penv *= kick.pdk; kick.env *= kick.adk; kick.cenv *= 0.985f;
-			if (kick.env < 0.0005f) kick.on = 0;
-			x *= kick.vel * 0.95f; L += x; R += x;
-		}
-		// snare
-		if (snare.on) {
-			snare.ph += snare.f * (1.0f + snare.tenv * 0.5f) / SR; if (snare.ph >= 1) snare.ph -= 1;
-			float nz = nrandA();
-			snare.lp += snare.bf * snare.bp;
-			float hp = nz - snare.lp - 0.7f * snare.bp;
-			snare.bp += snare.bf * hp;
-			x = fsin(snare.ph) * snare.tenv * (1.0f - snare.mix * 0.5f) + (snare.bp * 0.8f + hp * 0.3f) * snare.nenv * snare.mix;
-			snare.tenv *= snare.tdk; snare.nenv *= snare.ndk;
-			if (snare.nenv < 0.0005f && snare.tenv < 0.0005f) snare.on = 0;
-			x *= snare.vel * 0.7f; L += x; R += x;
-		}
-		// hat
-		if (hat.on) {
-			static const float rat[6] = {1.0f, 1.342f, 1.2312f, 1.6532f, 1.9523f, 2.1523f};
-			float s = 0;
-			for (int k = 0; k < 6; k++) { hat.ph[k] += hat.f * rat[k] / SR; if (hat.ph[k] >= 1) hat.ph[k] -= 1; s += hat.ph[k] < 0.5f ? 1 : -1; }
-			s = s * 0.16f + nrandA() * 0.25f;
-			hat.h1 = 0.46f * (hat.h1 + s - hat.x1); hat.x1 = s;
-			hat.h2 = 0.46f * (hat.h2 + hat.h1 - hat.x2); hat.x2 = hat.h1;
-			x = hat.h2 * hat.env * hat.vel * 0.8f;
-			hat.env *= hat.dk; if (hat.env < 0.0005f) hat.on = 0;
-			L += x * 0.8f; R += x;
-		}
-		// perc: a slice of the tape
-		if (perc.on) {
-			int p0 = (int)perc.pos;
-			if (p0 >= tl - 1 || tl < 2) perc.on = 0;
-			else {
-				float fr = perc.pos - p0;
-				x = (tape[p0] + (tape[p0 + 1] - tape[p0]) * fr) * (1.0f / 32768.0f);
-				x = softclip(x * 2.0f) * perc.env * perc.vel;
-				perc.pos += perc.inc; perc.env *= perc.dk;
-				if (perc.env < 0.0005f) perc.on = 0;
-				L += x; R += x * 0.8f;
+		// ---- voices
+		float L = 0, R = 0;
+		for (int vi = 0; vi < MAXVOX; vi++) {
+			Voice* v = &vox[vi];
+			if (!v->on) continue;
+			int p = v->pos, p1 = p + v->dir;
+			float s0 = v->d[p], s1 = (p1 >= v->start && p1 < v->end) ? v->d[p1] : 0;
+			float x = (s0 + (s1 - s0) * v->frac) * (1.0f / 32768.0f);
+			int remain = v->dir > 0 ? v->end - p : p - v->start + 1;
+			if (remain < 48) x *= remain / 48.0f;
+			if (v->played < 24) x *= v->played / 24.0f;
+			v->played++;
+			v->frac += v->step;
+			int adv = (int)v->frac; v->frac -= adv;
+			v->pos += adv * v->dir;
+			if (v->pos >= v->end || v->pos < v->start) v->on = 0;
+			if (v->filt) {
+				float v3 = x - v->ic2;
+				float v1 = v->a1 * v->ic1 + v->a2 * v3;
+				float v2 = v->ic2 + v->a2 * v->ic1 + v->a3 * v3;
+				v->ic1 = 2 * v1 - v->ic1; v->ic2 = 2 * v2 - v->ic2;
+				x = v2;
 			}
-		}
-		// synth
-		for (int v = 0; v < NSYN; v++) {
-			SynV* s = &syn[v];
-			if (!s->on) continue;
-			if (s->stage == 0) { s->env += aInc; if (s->env >= 1) { s->env = 1; s->stage = 1; } }
-			else if (s->stage == 1) s->env += (P.synS - s->env) * sdk;
-			else if (s->stage == 3) { s->env *= rk; if (s->env < 0.0005f) { s->on = 0; continue; } }
-			if (s->gate > 0) { s->gate--; if (s->gate == 0) s->stage = 3; }
-			s->wpos += s->wdir * wspeed;
-			if (s->wpos >= NTAB - 1) { s->wpos = NTAB - 1.001f; s->wdir = -1; }
-			if (s->wpos < 0) { s->wpos = 0; s->wdir = 1; }
-			int t0 = (int)s->wpos; float ft = s->wpos - t0;
-			const float* A = wtab + t0 * TABN; const float* B = wtab + (t0 + 1) * TABN;
-			float p = s->ph * TABN; int i0 = (int)p; float fr = p - i0; i0 &= TABN - 1; int i1 = (i0 + 1) & (TABN - 1);
-			float a = A[i0] + (A[i1] - A[i0]) * fr, b = B[i0] + (B[i1] - B[i0]) * fr;
-			x = a + (b - a) * ft;
-			s->ph += s->freq / SR; if (s->ph >= 1) s->ph -= 1;
-			float fc = clampf(P.synCut * (1.0f + P.synEnv * 3.0f * s->env), 40.0f, 5000.0f);
-			float f = 2.0f * fsin(fc / (2.0f * SR));
-			s->lp += f * s->bp; float hp = x - s->lp - sq * s->bp; s->bp += f * hp;
-			x = s->lp * s->env * s->vel * 0.32f;
-			L += x; R += x;
-		}
-		// grain cloud
-		int cloud = grainTouch || grainLatch || burstLeft > 0 || keysGrain;
-		if (burstLeft > 0) burstLeft--;
-		if (cloud && tl > 0) {
-			grainTimer -= 1.0f;
-			if (grainTimer <= 0) {
-				grainTimer += SR / dens * (0.7f + 0.6f * frandA());
-				int semi = cloudSemiBase + (burstLeft > 0 ? burstSemi : (keysGrain ? keysSemi : 0));
-				spawnGrain(semi);
+			switch (v->stage) {
+			case 0: v->env += v->att; if (v->env >= 1) { v->env = 1; v->stage = 1; } break;
+			case 1:
+				if (v->noteOn) {
+					if (v->gate > 0 && --v->gate == 0) v->stage = 2;
+				} else if (v->decOn) v->env *= v->dec;
+				break;
+			case 2: v->env *= v->rel; break;
 			}
+			if (v->env < 0.0005f && v->stage != 0) v->on = 0;
+			L += x * v->env * v->gl; R += x * v->env * v->gr;
 		}
-		for (int gi = 0; gi < MAXGR; gi++) {
-			Grain* g = &grains[gi];
-			if (!g->on) continue;
-			const s16* buf = g->src ? smp : tape;
-			int rl = g->re - g->rs;
-			if (rl < 2 || (!g->src && g->re > tl)) { g->on = 0; grainVisOn[gi] = 0; continue; }
-			int p0 = (int)g->pos; float fr = g->pos - p0;
-			int p1 = p0 + 1; if (p1 >= g->re) p1 = g->rs;
-			float s = (buf[p0] + (buf[p1] - buf[p0]) * fr) * (1.0f / 32768.0f);
-			s *= hannT[(g->age * 1024) / g->len] * g->amp;
-			L += s * g->pl; R += s * g->pr;
-			g->pos += g->inc;
-			if (g->pos >= g->re) g->pos -= rl;
-			if (g->pos < g->rs) g->pos += rl;
-			if (++g->age >= g->len) { g->on = 0; grainVisOn[gi] = 0; }
+		// ---- metronome
+		if (metroEnv > 0.001f) {
+			metroPh += metroF / SR; if (metroPh > 1) metroPh -= 1;
+			float c = (metroPh < 0.5f ? 0.25f : -0.25f) * metroEnv;
+			metroEnv *= 0.9985f;
+			L += c; R += c;
 		}
-		// sampler voices
-		for (int v = 0; v < NSMPV; v++) {
-			SmpV* s = &smpv[v];
-			if (!s->on) continue;
-			int p0 = (int)s->pos;
-			if (p0 >= (int)s->end - 1 || p0 >= smpLen - 1) { s->on = 0; continue; }
-			float fr = s->pos - p0;
-			float y = (smp[p0] + (smp[p0 + 1] - smp[p0]) * fr) * (1.0f / 32768.0f);
-			float left = s->end - s->pos;
-			if (left < 96) y *= left / 96.0f;
-			y *= s->env * s->vel;
-			s->env *= s->dk; if (s->env < 0.0005f) s->on = 0;
-			s->pos += s->inc;
-			L += y; R += y;
-		}
-		// tape looper
-		if (tl > 256) {
-			float target = tapeRun ? 1.0f : 0.0f;
-			if (tapeMul < target) { tapeMul += 1.0f / (0.12f * SR); if (tapeMul > 1) tapeMul = 1; }
-			else if (tapeMul > target) { tapeMul -= 1.0f / (0.6f * SR); if (tapeMul < 0) tapeMul = 0; }
-			if (tapeMul > 0) {
-				wowPh += 0.55f / SR; if (wowPh >= 1) wowPh -= 1;
-				flutPh += 6.3f / SR; if (flutPh >= 1) flutPh -= 1;
-				float sp = speed * tapeDir * tapeMul * (1.0f + wowD * fsin(wowPh) + flutD * fsin(flutPh));
-				tapePosD += sp;
-				while (tapePosD >= le) tapePosD -= (le - ls);
-				while (tapePosD < ls) tapePosD += (le - ls);
-				int p0 = (int)tapePosD; float fr = (float)(tapePosD - p0);
-				int p1 = p0 + 1; if (p1 >= le) p1 = ls;
-				x = (tape[p0] + (tape[p1] - tape[p0]) * fr) * (1.0f / 32768.0f);
-				x = softclip(x * drive) * driveComp;
-				x += hiss * nrandA();
-				toneLP += toneA * (x - toneLP);
-				float amp = tapeMul * 4.0f; if (amp > 1) amp = 1;
-				x = toneLP * tLevel * amp;
-				L += x; R += x;
-			}
-		}
-
-		out[i * 2]     = (s16)(softclip(L * 0.68f) * 32000.0f);
-		out[i * 2 + 1] = (s16)(softclip(R * 0.68f) * 32000.0f);
+		// ---- master
+		L *= mv; R *= mv;
+		vinPh += vinInc;
+		if (vintage) { L = vintageProc(L, &vinHoldL, 0); R = vintageProc(R, &vinHoldR, 1); }
+		if (vinPh >= 1.0f) vinPh -= 1.0f;
+		if (useMF) {
+			float v3 = L - mfIc2L, v1 = ma1 * mfIc1L + ma2 * v3, v2 = mfIc2L + ma2 * mfIc1L + ma3 * v3;
+			mfIc1L = 2 * v1 - mfIc1L; mfIc2L = 2 * v2 - mfIc2L; L = hp ? L - mfK * v1 - v2 : v2;
+			v3 = R - mfIc2R; v1 = ma1 * mfIc1R + ma2 * v3; v2 = mfIc2R + ma2 * mfIc1R + ma3 * v3;
+			mfIc1R = 2 * v1 - mfIc1R; mfIc2R = 2 * v2 - mfIc2R; R = hp ? R - mfK * v1 - v2 : v2;
+		} else { mfIc1L = mfIc2L = mfIc1R = mfIc2R = 0; }
+		// soft clip
+		if (L > 1.5f) L = 1.5f; if (L < -1.5f) L = -1.5f;
+		if (R > 1.5f) R = 1.5f; if (R < -1.5f) R = -1.5f;
+		L = L - L * L * L * 0.148f; R = R - R * R * R * 0.148f;
+		float a = fabsf(L) > fabsf(R) ? fabsf(L) : fabsf(R); if (a > pk) pk = a;
+		out[i * 2] = (s16)(L * 32000.0f); out[i * 2 + 1] = (s16)(R * 32000.0f);
 	}
-	if (tl > 0) tapePosFrac = (float)(tapePosD / tl);
-	stepFrac = 1.0f - stepCountdown / stepLen;
+	meterL = pk > meterL ? pk : meterL * 0.9f;
 }
 
-// ---------------------------------------------------------------- audio thread
+// ---- audio thread
 static ndspWaveBuf wbuf[NBUFS];
-static s16* audioMem;
-static LightEvent audioEvent;
-static volatile int audioRun = 1;
-static void audioCallback(void* d) { (void)d; LightEvent_Signal(&audioEvent); }
+static s16* audioMem = NULL;
+static LightEvent audioEv;
+static volatile int audioQuit = 0;
+
+static void ndspCb(void* arg) { (void)arg; LightEvent_Signal(&audioEv); }
 static void audioThread(void* arg) {
 	(void)arg;
-	while (audioRun) {
+	while (!audioQuit) {
 		for (int i = 0; i < NBUFS; i++) {
 			if (wbuf[i].status == NDSP_WBUF_DONE) {
+				LightLock_Lock(&alock);
 				fillAudio((s16*)wbuf[i].data_vaddr, BUF_SAMPLES);
+				LightLock_Unlock(&alock);
 				DSP_FlushDataCache(wbuf[i].data_vaddr, BUF_SAMPLES * 4);
 				ndspChnWaveBufAdd(0, &wbuf[i]);
 			}
 		}
-		LightEvent_Wait(&audioEvent);
-	}
-}
-static void audioHold(int on) {
-	if (!audioOK) return;
-	if (on) {
-		holdAck = 0; __sync_synchronize(); holdReq = 1;
-		for (int i = 0; i < 100 && !holdAck; i++) svcSleepThread(2000000LL);
-	} else holdReq = 0;
-}
-
-// ---------------------------------------------------------------- photo analysis -> patch
-static void rgb2hs(float r, float g, float b, float* h, float* s) {
-	float mx = fmaxf(r, fmaxf(g, b)), mn = fminf(r, fminf(g, b)), d = mx - mn;
-	*s = mx > 0.001f ? d / mx : 0;
-	if (d < 0.0001f) { *h = 0; return; }
-	float hh;
-	if (mx == r) hh = (g - b) / d; else if (mx == g) hh = 2.0f + (b - r) / d; else hh = 4.0f + (r - g) / d;
-	hh *= 60.0f; if (hh < 0) hh += 360.0f;
-	*h = hh;
-}
-
-static void analyzePhoto(void) {
-	double sr = 0, sg = 0, sb = 0, sl = 0, sl2 = 0, ss = 0, hx = 0, hy = 0, se = 0; int cnt = 0;
-	for (int y = 0; y < PH; y++)
-		for (int x = 0; x < PW; x++) {
-			const u8* p = photo[y][x];
-			luma[y][x] = (u8)((p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8);
-		}
-	for (int y = 0; y < PH; y += 2)
-		for (int x = 0; x < PW - 2; x += 2) {
-			const u8* p = photo[y][x];
-			float r = p[0] / 255.0f, g = p[1] / 255.0f, b = p[2] / 255.0f, l = luma[y][x] / 255.0f;
-			float h, s; rgb2hs(r, g, b, &h, &s);
-			sr += r; sg += g; sb += b; sl += l; sl2 += l * l; ss += s;
-			hx += cosf(h * 0.0174533f) * s; hy += sinf(h * 0.0174533f) * s;
-			se += fabsf(l - luma[y][x + 2] / 255.0f);
-			cnt++;
-		}
-	P.r = sr / cnt; P.g = sg / cnt; P.b = sb / cnt; P.lum = sl / cnt; P.sat = ss / cnt;
-	float var = sl2 / cnt - P.lum * P.lum;
-	P.contrast = clampf(sqrtf(fmaxf(var, 0)) * 3.0f, 0, 1);
-	P.edge = clampf((float)(se / cnt) * 6.0f, 0, 1);
-	float hue = atan2f(hy, hx) * 57.2958f; if (hue < 0) hue += 360.0f;
-	P.hue = hue;
-	P.root = ((int)floorf(hue / 30.0f + 0.5f)) % 12;
-	int lvl = (int)(clampf(P.lum * 1.6f, 0, 0.999f) * 4);
-	P.scale = lvl * 2 + (P.r > P.b ? 1 : 0);
-
-	// brightest-contrast column -> perc slice
-	float best = -1; P.percCol = PW / 2;
-	for (int x = 4; x < PW - 4; x += 2) {
-		float m = 0, m2 = 0;
-		for (int y = 0; y < PH; y += 4) { float l = luma[y][x] / 255.0f; m += l; m2 += l * l; }
-		m /= PH / 4; m2 /= PH / 4;
-		float v = m2 - m * m + m * 0.05f;
-		if (v > best) { best = v; P.percCol = x; }
-	}
-
-	P.kickF0 = 90.0f + 200.0f * P.r;
-	P.kickF1 = 38.0f + 30.0f * P.lum;
-	P.kickPD = 0.02f + 0.06f * (1.0f - P.contrast);
-	P.kickAD = 0.15f + 0.5f * P.contrast;
-	P.kickClick = P.edge;
-	P.snTone = 150.0f + 150.0f * P.g;
-	P.snNoise = 0.4f + 0.6f * P.edge;
-	P.snDecay = 0.08f + 0.25f * (1.0f - P.lum);
-	P.snBP = 800.0f + 3500.0f * P.b;
-	P.hatBase = 300.0f + 500.0f * P.sat;
-	P.hatDecay = 0.025f + 0.15f * P.lum;
-	P.percDecay = 0.05f + 0.3f * P.sat;
-	float ic = 1.0f - P.contrast;
-	P.synA = 0.002f + 0.4f * ic * ic;
-	P.synD = 0.1f + 0.8f * P.lum;
-	P.synS = 0.3f + 0.6f * P.sat;
-	P.synR = 0.05f + 1.2f * ic;
-	P.synCut = 250.0f + 4000.0f * powf(P.lum, 1.5f);
-	P.synRes = clampf(0.1f + P.edge * 0.8f, 0, 0.85f);
-	P.synEnv = 0.3f + P.sat;
-	P.synScan = hue / 360.0f;
-	P.synMove = 0.1f + P.edge;
-}
-
-static void buildWavetables(void) {
-	float tmp[128];
-	for (int t = 0; t < NTAB; t++) {
-		int c = t * (PW - 1) / (NTAB - 1);
-		float mean = 0;
-		for (int i = 0; i < 128; i++) {
-			int y = i * (PH - 1) / 127, s = 0, k = 0;
-			for (int dx = -1; dx <= 1; dx++) { int xx = c + dx; if (xx < 0 || xx >= PW) continue; s += luma[y][xx]; k++; }
-			tmp[i] = s / (255.0f * k); mean += tmp[i];
-		}
-		mean /= 128;
-		float* T = wtab + t * TABN;
-		for (int i = 0; i < 128; i++) { T[i] = tmp[i] - mean; T[TABN - 1 - i] = tmp[i] - mean; }
-		for (int pass = 0; pass < 2; pass++) {
-			float prev = T[TABN - 1], first = T[0];
-			for (int i = 0; i < TABN; i++) {
-				float nx = (i == TABN - 1) ? first : T[i + 1];
-				float cur = T[i];
-				T[i] = (prev + 2 * cur + nx) * 0.25f;
-				prev = cur;
-			}
-		}
-		float pk = 0;
-		for (int i = 0; i < TABN; i++) pk = fmaxf(pk, fabsf(T[i]));
-		if (pk < 0.002f) for (int i = 0; i < TABN; i++) T[i] = sinf(TWO_PI_F * i / TABN);
-		else for (int i = 0; i < TABN; i++) T[i] /= pk;
+		LightEvent_Wait(&audioEv);
 	}
 }
 
-static void buildCaches(void) {
-	for (int x = 0; x < PW; x++)
-		for (int y = 0; y < PH; y++) {
-			u8* d = topCache + (x * 240 + (239 - y)) * 3;
-			const u8* s = photo[y][x];
-			d[0] = s[2]; d[1] = s[1]; d[2] = s[0];
-		}
-	for (int i = 0; i < PW * PH * 3; i++) topDim[i] = (topCache[i] * 100) >> 8;
-	for (int y = 0; y < 80; y++)
-		for (int x = 0; x < 320; x++) {
-			int sx = x * PW / 320, sy = y * PH / 80;
-			memcpy(stripCache[y][x], photo[sy][sx], 3);
-		}
+// ================================================================ drum synthesis (built-in kits)
+static u32 rngS = 0x1234567;
+static inline float frand(void) { rngS = rngS * 1664525u + 1013904223u; return ((rngS >> 9) / 4194304.0f) - 1.0f; }
+
+typedef struct { float ic1, ic2, a1, a2, a3, k; } SVF;
+static void svfSet(SVF* f, float fc, float q) {
+	if (fc > SR * 0.45f) fc = SR * 0.45f;
+	float g = tanf(PI_F * fc / SR); f->k = 1.0f / q;
+	f->a1 = 1.0f / (1.0f + g * (g + f->k)); f->a2 = g * f->a1; f->a3 = g * f->a2;
+}
+// mode 0 LP 1 BP 2 HP
+static inline float svf(SVF* f, float x, int mode) {
+	float v3 = x - f->ic2, v1 = f->a1 * f->ic1 + f->a2 * v3, v2 = f->ic2 + f->a2 * f->ic1 + f->a3 * v3;
+	f->ic1 = 2 * v1 - f->ic1; f->ic2 = 2 * v2 - f->ic2;
+	return mode == 0 ? v2 : (mode == 1 ? v1 : x - f->k * v1 - v2);
 }
 
-// ---------------------------------------------------------------- photo -> tape
-static inline float wtOsc(float t, float ph) {
-	int t0 = (int)t; if (t0 >= NTAB - 1) t0 = NTAB - 2; float ft = t - t0;
-	const float* A = wtab + t0 * TABN; const float* B = A + TABN;
-	float p = ph * TABN; int i0 = (int)p; float fr = p - i0; i0 &= TABN - 1; int i1 = (i0 + 1) & (TABN - 1);
-	float a = A[i0] + (A[i1] - A[i0]) * fr, b = B[i0] + (B[i1] - B[i0]) * fr;
-	return a + (b - a) * ft;
-}
-
-static void computeTapePeaks(void) {
-	int tl = tapeLen;
-	for (int x = 0; x < 320; x++) {
-		int a = (int)((long long)x * tl / 320), b = (int)((long long)(x + 1) * tl / 320); int pk = 0;
-		for (int i = a; i < b; i += 4) { int v = abs(tape[i]); if (v > pk) pk = v; }
-		tapePeak[x] = pk >> 8;
-	}
-}
-static void computeSmpPeaks(void) {
-	int n = smpLen;
-	for (int x = 0; x < 400; x++) {
-		int a = (int)((long long)x * n / 400), b = (int)((long long)(x + 1) * n / 400); int pk = 0;
-		for (int i = a; i < b; i += 2) { int v = abs(smp[i]); if (v > pk) pk = v; }
-		smpPeak[x] = pk >> 8;
-	}
-}
-
-static void renderTape(void) {
-	audioHold(1);
-	int len = 0;
-	float* acc = (float*)malloc(TAPE_MAX * sizeof(float));
-	if (!acc) { audioHold(0); return; }
-	int colLen = TAPE_MAX / PW;
-	if (tapeMode == TM_MIC && smpE - smpS < 1000) tapeMode = TM_SPECTRAL;
-	if (tapeMode == TM_SPECTRAL) {
-		int nb = SCALES[P.scale].n * 4 + 1;
-		static float A[PW + 1];
-		len = colLen * PW;
-		memset(acc, 0, len * sizeof(float));
-		for (int b = 0; b < nb; b++) {
-			int y0 = PH - (b + 1) * PH / nb, y1 = PH - b * PH / nb; int any = 0;
-			for (int c = 0; c < PW; c++) {
-				int s = 0; for (int y = y0; y < y1; y++) s += luma[y][c];
-				float v = (s / (255.0f * (y1 - y0)) - 0.3f) / 0.7f;
-				if (v < 0) v = 0;
-				A[c] = v * v; if (A[c] > 0) any = 1;
-			}
-			A[PW] = A[PW - 1];
-			if (!any) continue;
-			float inc = mtof(36 + P.root + degSemi(b)) / SR, ph = frandM();
-			float w = 1.0f / (1.0f + b * 0.04f);
-			for (int c = 0; c < PW; c++) {
-				float a0 = A[c] * w, a1 = A[c + 1] * w;
-				if (a0 == 0 && a1 == 0) { ph += inc * colLen; ph -= floorf(ph); continue; }
-				float da = (a1 - a0) / colLen, a = a0;
-				float* o = acc + c * colLen;
-				for (int i = 0; i < colLen; i++) { o[i] += fsin(ph) * a; a += da; ph += inc; if (ph >= 1) ph -= 1; }
-			}
-		}
-	} else if (tapeMode == TM_WAVE) {
-		len = colLen * PW;
-		float f = mtof(48 + P.root) / SR, p1 = 0, p2 = 0.3f, p3 = 0.6f;
-		for (int i = 0; i < len; i++) {
-			float t = (float)i / len * (NTAB - 1);
-			int c = i / colLen; if (c >= PW) c = PW - 1;
-			float amp = 0.3f; { int s = 0; for (int y = 0; y < PH; y += 8) s += luma[y][c]; amp += s / (255.0f * PH / 8); }
-			acc[i] = (wtOsc(t, p1) * 0.55f + wtOsc(t, p2) * 0.25f + wtOsc(t, p3) * 0.45f) * amp;
-			p1 += f; if (p1 >= 1) p1 -= 1;
-			p2 += f * 1.5f * 1.002f; if (p2 >= 1) p2 -= 1;
-			p3 += f * 0.5f; if (p3 >= 1) p3 -= 1;
-		}
-	} else if (tapeMode == TM_SCAN) {
-		len = PW * PH;
-		int k = 0;
-		for (int x = 0; x < PW; x++)
-			for (int j = 0; j < PH; j++) { int y = (x & 1) ? PH - 1 - j : j; acc[k++] = luma[y][x] / 255.0f - 0.5f; }
-		float xp = 0, y = 0, lp = 0;
-		for (int i = 0; i < len; i++) { float xx = acc[i]; y = xx - xp + 0.995f * y; xp = xx; lp += 0.5f * (y - lp); acc[i] = lp; }
-	} else {   // MIC
-		len = smpE - smpS; if (len > TAPE_MAX) len = TAPE_MAX;
-		for (int i = 0; i < len; i++) acc[i] = smp[smpS + i] / 32768.0f;
-	}
+static float* gbuf; static int gN;
+static void gStart(float secs) { gN = (int)(secs * SR); memset(gbuf, 0, gN * sizeof(float)); }
+static int gFinish(int pad, const char* name, int mgroup) {
 	float pk = 0.0001f;
-	for (int i = 0; i < len; i++) pk = fmaxf(pk, fabsf(acc[i]));
-	float g = (tapeMode == TM_MIC ? 1.0f : 0.9f) / pk;
-	if (tapeMode == TM_MIC && pk < 1.0f) g = 1.0f;
-	for (int i = 0; i < len; i++) tape[i] = (s16)clampf(acc[i] * g * 32767.0f, -32767, 32767);
-	free(acc);
-	tapeLen = len;
-	tapePosD = loopS * len;
-	for (int i = 0; i < MAXGR; i++) { grains[i].on = 0; grainVisOn[i] = 0; }
-	perc.on = 0;
-	computeTapePeaks();
-	audioHold(0);
+	for (int i = 0; i < gN; i++) { float a = fabsf(gbuf[i]); if (a > pk) pk = a; }
+	int n = gN;   // trim silent tail
+	while (n > 64 && fabsf(gbuf[n - 1]) < pk * 0.0015f) n--;
+	int s = smpAlloc(n, name);
+	if (s < 0) return -1;
+	float g = 0.92f / pk;
+	for (int i = 0; i < n; i++) smp[s].d[i] = (s16)(gbuf[i] * g * 32767.0f);
+	padReset(&pads[pad]); padAssign(pad, s); pads[pad].mgroup = mgroup;
+	return s;
 }
 
-// ---------------------------------------------------------------- default picture
-static void genDefaultPhoto(void) {
-	for (int y = 0; y < PH; y++)
-		for (int x = 0; x < PW; x++) {
-			float r, g, b;
-			float sy = y / 140.0f;
-			if (y < 140) {
-				r = 250 - 90 * sy; g = 150 - 100 * sy; b = 80 + 90 * sy;
-				float dx = x - 270, dy = y - 105, d = sqrtf(dx * dx + dy * dy);
-				if (d < 38) { r = 255; g = 220 - d; b = 120; }
-				else if (d < 70) { float k = (70 - d) / 32.0f * 0.5f; r += (255 - r) * k; g += (200 - g) * k; }
-				if (y > 70 && fabsf(sinf(x * 0.05f) * 20 + 120 - y) < 3 && x < 170) { r *= 0.3f; g *= 0.3f; b *= 0.4f; }
-			} else {
-				float k = (y - 140) / 100.0f;
-				r = 60 - 40 * k; g = 50 - 20 * k; b = 110 - 40 * k;
-				float ref = sinf(x * 0.09f + y * 0.7f) * 0.5f + 0.5f;
-				if (abs(x - 270) < 50 - k * 30 && ref > 0.6f) { r = 250; g = 180; b = 110; }
-			}
-			if (x > 40 && x < 52 && y > 60 && y < 140) { r = g = b = 20; }
-			if (y > 50 && y < 75 && fabsf((x - 46) * 0.6f) < (75 - y) * 1.2f && fabsf(sinf(x * 0.3f)) > 0.3f) { r = 25; g = 30; b = 25; }
-			photo[y][x][0] = (u8)clampf(r, 0, 255); photo[y][x][1] = (u8)clampf(g, 0, 255); photo[y][x][2] = (u8)clampf(b, 0, 255);
+static void gKick(float f0, float f1, float pdec, float adec, float click, float drive) {
+	float ph = 0; gStart(adec * 5);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR, f = f1 + (f0 - f1) * expf(-t / pdec);
+		ph += 2 * PI_F * f / SR;
+		float s = sinf(ph) * expf(-t / adec) + frand() * click * expf(-t / 0.0015f);
+		gbuf[i] = tanhf(s * drive) / tanhf(drive);
+	}
+}
+static void gSnare(float tone, float tdec, float ndec, float nmix, float bright) {
+	SVF hp; memset(&hp, 0, sizeof(hp)); svfSet(&hp, bright, 0.7f);
+	float p1 = 0, p2 = 0; gStart(ndec * 5);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR;
+		p1 += 2 * PI_F * tone * (1 + 0.5f * expf(-t / 0.01f)) / SR; p2 += 2 * PI_F * tone * 1.6f / SR;
+		float body = (sinf(p1) + 0.45f * sinf(p2)) * expf(-t / tdec);
+		float nz = svf(&hp, frand(), 2) * expf(-t / ndec);
+		gbuf[i] = body * (1 - nmix) + nz * nmix * 1.3f;
+	}
+}
+static const float METAL[6] = {205.3f, 304.4f, 369.6f, 522.7f, 540.0f, 800.0f};
+static void gMetal(float dec, float hpf, float scale, float noise, float secs) {
+	SVF hp, bp; memset(&hp, 0, sizeof(hp)); memset(&bp, 0, sizeof(bp));
+	svfSet(&hp, hpf, 0.9f); svfSet(&bp, hpf * 1.3f, 1.2f);
+	float ph[6] = {0}; gStart(secs);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR, s = 0;
+		for (int k = 0; k < 6; k++) { ph[k] += METAL[k] * scale / SR; if (ph[k] >= 1) ph[k] -= 1; s += ph[k] < 0.5f ? 1 : -1; }
+		s = s / 6 + frand() * noise;
+		s = svf(&hp, svf(&bp, s, 1) + s * 0.3f, 2);
+		gbuf[i] = s * expf(-t / dec) * (1 - expf(-t / 0.0008f));
+	}
+}
+static void gClap(float tail) {
+	SVF bp; memset(&bp, 0, sizeof(bp)); svfSet(&bp, 1150, 1.6f); gStart(0.08f + tail * 5);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR, e = 0;
+		for (int b = 0; b < 3; b++) { float dt = t - b * 0.011f; if (dt >= 0) e += expf(-dt / 0.0035f); }
+		float dt = t - 0.033f; if (dt >= 0) e += 0.8f * expf(-dt / tail);
+		gbuf[i] = svf(&bp, frand(), 1) * e;
+	}
+}
+static void gRim(void) {
+	SVF bp; memset(&bp, 0, sizeof(bp)); svfSet(&bp, 2200, 3); float p1 = 0, p2 = 0; gStart(0.08f);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR; p1 += 2 * PI_F * 1700 / SR; p2 += 2 * PI_F * 480 / SR;
+		gbuf[i] = sinf(p1) * expf(-t / 0.007f) + 0.6f * sinf(p2) * expf(-t / 0.012f) + svf(&bp, frand(), 1) * expf(-t / 0.004f);
+	}
+}
+static void gTone(float f0, float f1, float pdec, float adec, float noise, int sq) {
+	float ph = 0; gStart(adec * 5);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR, f = f1 + (f0 - f1) * expf(-t / pdec);
+		ph += 2 * PI_F * f / SR;
+		float s = sq ? (sinf(ph) > 0 ? 0.6f : -0.6f) : sinf(ph);
+		gbuf[i] = s * expf(-t / adec) + frand() * noise * expf(-t / 0.01f);
+	}
+}
+static void gShaker(float a, float d) {
+	SVF hp; memset(&hp, 0, sizeof(hp)); svfSet(&hp, 6500, 0.8f); gStart(a + d * 5);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR, e = t < a ? t / a : expf(-(t - a) / d);
+		gbuf[i] = svf(&hp, frand(), 2) * e;
+	}
+}
+static void gCowbell(void) {
+	SVF bp; memset(&bp, 0, sizeof(bp)); svfSet(&bp, 2400, 1.5f); float a = 0, b = 0; gStart(0.5f);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR; a += 562.0f / SR; b += 845.0f / SR; if (a >= 1) a -= 1; if (b >= 1) b -= 1;
+		float s = (a < 0.5f ? 1 : -1) + (b < 0.5f ? 1 : -1);
+		gbuf[i] = svf(&bp, s, 1) * (0.6f * expf(-t / 0.012f) + 0.4f * expf(-t / 0.11f));
+	}
+}
+static void gBass(float f, float dec) {
+	float ph = 0; gStart(dec * 4);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR, ff = f * (1 + 0.6f * expf(-t / 0.02f));
+		ph += 2 * PI_F * ff / SR;
+		gbuf[i] = tanhf(1.6f * sinf(ph) * expf(-t / dec)) * (1 - expf(-t / 0.001f));
+	}
+}
+static void gStab(void) {
+	static const float NOTES[5] = {130.81f, 155.56f, 196.0f, 233.08f, 293.66f};
+	SVF lp; memset(&lp, 0, sizeof(lp)); float ph[10] = {0}; gStart(1.4f);
+	for (int i = 0; i < gN; i++) {
+		float t = (float)i / SR, s = 0;
+		for (int k = 0; k < 10; k++) {
+			ph[k] += NOTES[k % 5] * (k < 5 ? 1.003f : 0.997f) / SR; if (ph[k] >= 1) ph[k] -= 1;
+			s += ph[k] * 2 - 1;
 		}
-}
-
-// ---------------------------------------------------------------- files
-static void ensureDir(void) { mkdir("sdmc:/3ds", 0777); mkdir(PT_DIR, 0777); }
-
-static void put32(u8* p, u32 v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
-static void put16(u8* p, u16 v) { p[0] = v; p[1] = v >> 8; }
-static u32 get32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
-
-static int saveBMP(const char* path) {
-	FILE* f = fopen(path, "wb"); if (!f) return 0;
-	u8 h[54]; memset(h, 0, 54);
-	int rowB = PW * 3, sz = rowB * PH;
-	h[0] = 'B'; h[1] = 'M'; put32(h + 2, 54 + sz); put32(h + 10, 54); put32(h + 14, 40);
-	put32(h + 18, PW); put32(h + 22, PH); put16(h + 26, 1); put16(h + 28, 24); put32(h + 34, sz);
-	fwrite(h, 1, 54, f);
-	u8 row[PW * 3];
-	for (int y = PH - 1; y >= 0; y--) {
-		for (int x = 0; x < PW; x++) { row[x * 3] = photo[y][x][2]; row[x * 3 + 1] = photo[y][x][1]; row[x * 3 + 2] = photo[y][x][0]; }
-		fwrite(row, 1, rowB, f);
+		if ((i & 15) == 0) svfSet(&lp, 500 + 4200 * expf(-t / 0.12f), 1.1f);
+		gbuf[i] = svf(&lp, s * 0.12f, 0) * expf(-t / 0.35f) * (1 - expf(-t / 0.002f));
 	}
-	fclose(f); return 1;
 }
 
-static int loadBMP(const char* path) {
-	FILE* f = fopen(path, "rb"); if (!f) return 0;
-	u8 h[54];
-	if (fread(h, 1, 54, f) != 54 || h[0] != 'B' || h[1] != 'M') { fclose(f); return 0; }
-	u32 off = get32(h + 10); int w = (int)get32(h + 18); int hh = (int)get32(h + 22); int bpp = h[28] | (h[29] << 8);
-	if (bpp != 24 || w <= 0 || w > 4096 || hh == 0 || hh > 4096 || hh < -4096) { fclose(f); return 0; }
-	int top = hh < 0; if (top) hh = -hh;
-	int rowB = (w * 3 + 3) & ~3;
-	u8* img = (u8*)malloc(rowB * hh);
-	if (!img) { fclose(f); return 0; }
-	fseek(f, off, SEEK_SET);
-	int ok = fread(img, 1, rowB * hh, f) == (size_t)(rowB * hh);
-	fclose(f);
-	if (ok)
-		for (int y = 0; y < PH; y++)
-			for (int x = 0; x < PW; x++) {
-				int sx = x * w / PW, sy = y * hh / PH;
-				int ry = top ? sy : hh - 1 - sy;
-				const u8* s = img + ry * rowB + sx * 3;
-				photo[y][x][0] = s[2]; photo[y][x][1] = s[1]; photo[y][x][2] = s[0];
+// MPC pad numbering: index 0 = pad 1 (bottom-left)
+static void buildKits(void) {
+	gbuf = (float*)malloc(SR * 8 * sizeof(float));
+	if (!gbuf) return;
+	// Bank A: boom bap
+	gKick(150, 50, 0.04f, 0.32f, 0.5f, 2.5f);        gFinish(0, "KICK", 0);
+	gSnare(190, 0.06f, 0.17f, 0.75f, 1500);          gFinish(1, "SNARE", 0);
+	gMetal(0.04f, 7000, 1.0f, 0.3f, 0.3f);           gFinish(2, "HAT CL", 1);
+	gMetal(0.33f, 7000, 1.0f, 0.3f, 1.6f);           gFinish(3, "HAT OP", 1);
+	gClap(0.12f);                                    gFinish(4, "CLAP", 0);
+	gRim();                                          gFinish(5, "RIM", 0);
+	gKick(120, 44, 0.05f, 0.55f, 0.25f, 1.6f);       gFinish(6, "KICK 2", 0);
+	gSnare(235, 0.04f, 0.11f, 0.85f, 2600);          gFinish(7, "SNARE 2", 0);
+	gTone(150, 92, 0.06f, 0.28f, 0.3f, 0);           gFinish(8, "TOM LO", 0);
+	gTone(210, 135, 0.06f, 0.24f, 0.3f, 0);          gFinish(9, "TOM MID", 0);
+	gTone(290, 190, 0.05f, 0.2f, 0.3f, 0);           gFinish(10, "TOM HI", 0);
+	gShaker(0.018f, 0.05f);                          gFinish(11, "SHAKER", 0);
+	gMetal(0.6f, 5200, 1.9f, 0.15f, 3.0f);           gFinish(12, "RIDE", 0);
+	gMetal(0.9f, 4200, 1.37f, 0.6f, 4.5f);           gFinish(13, "CRASH", 0);
+	gBass(65.41f, 0.9f);                             gFinish(14, "808 C", 0);
+	gStab();                                         gFinish(15, "STAB Cm9", 0);
+	// Bank B: 808-style
+	gKick(70, 47, 0.03f, 0.75f, 0.15f, 1.15f);       gFinish(16, "808 KICK", 0);
+	gSnare(180, 0.05f, 0.2f, 0.6f, 900);             gFinish(17, "808 SNR", 0);
+	gMetal(0.05f, 8000, 1.0f, 0.1f, 0.3f);           gFinish(18, "808 CH", 1);
+	gMetal(0.45f, 8000, 1.0f, 0.1f, 2.2f);           gFinish(19, "808 OH", 1);
+	gClap(0.18f);                                    gFinish(20, "808 CLAP", 0);
+	gRim();                                          gFinish(21, "808 RIM", 0);
+	gCowbell();                                      gFinish(22, "COWBELL", 0);
+	gTone(2500, 2500, 1, 0.022f, 0.0f, 0);           gFinish(23, "CLAVE", 0);
+	gTone(240, 220, 0.03f, 0.17f, 0.05f, 0);         gFinish(24, "CONGA LO", 0);
+	gTone(340, 320, 0.03f, 0.15f, 0.05f, 0);         gFinish(25, "CONGA MD", 0);
+	gTone(450, 430, 0.03f, 0.13f, 0.05f, 0);         gFinish(26, "CONGA HI", 0);
+	gShaker(0.005f, 0.03f);                          gFinish(27, "MARACAS", 0);
+	gTone(110, 82, 0.08f, 0.45f, 0.1f, 0);           gFinish(28, "808 TOM L", 0);
+	gTone(180, 140, 0.08f, 0.35f, 0.1f, 0);          gFinish(29, "808 TOM H", 0);
+	gBass(55.0f, 1.6f);                              gFinish(30, "808 A", 0);
+	gMetal(1.1f, 6000, 1.15f, 0.4f, 5.0f);           gFinish(31, "CYMBAL", 0);
+	free(gbuf); gbuf = NULL;
+}
+
+static void demoSeq(void) {
+	// boom bap, 2 bars, pad numbers are 0-based
+	static const char* K = "x.........x.x...x.....x...x.....";
+	static const char* S = "....x.......x.......x.......x..x";
+	static const char* H = "x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.";
+	for (int i = 0; i < 32; i++) {
+		if (K[i] == 'x') evInsert(0, i * 240, 0, 0, 120, 240, 0);
+		if (S[i] == 'x') evInsert(0, i * 240, 1, 0, i == 31 ? 70 : 115, 240, 0);
+		if (H[i] == 'x') evInsert(0, i * 240, 2, 0, (i % 4 == 0) ? 105 : 75, 240, 0);
+	}
+	evInsert(0, 15 * 240, 3, 0, 80, 240, 0);
+	evInsert(0, 0, 15, 0, 90, 240, 0);
+	evInsert(0, 16 * 240 + 960, 15, -2, 80, 240, 0);
+	swing = 58;
+}
+
+// ================================================================ WAV I/O
+static void wr32(FILE* f, u32 v) { fwrite(&v, 4, 1, f); }
+static void wr16(FILE* f, u16 v) { fwrite(&v, 2, 1, f); }
+static int wavWrite(const char* path, const s16* d, int n) {
+	FILE* f = fopen(path, "wb"); if (!f) return 0;
+	fwrite("RIFF", 1, 4, f); wr32(f, 36 + n * 2); fwrite("WAVEfmt ", 1, 8, f);
+	wr32(f, 16); wr16(f, 1); wr16(f, 1); wr32(f, SR); wr32(f, SR * 2); wr16(f, 2); wr16(f, 16);
+	fwrite("data", 1, 4, f); wr32(f, n * 2);
+	int ok = (int)fwrite(d, 2, n, f) == n;
+	fclose(f); return ok;
+}
+
+// returns sample slot or -1; err gets a short reason
+static int wavLoad(const char* path, const char* name, const char** err) {
+	*err = "CAN'T OPEN";
+	FILE* f = fopen(path, "rb"); if (!f) return -1;
+	char id[4]; u32 sz; u8 hdr[12];
+	*err = "NOT A WAV";
+	if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) || memcmp(hdr + 8, "WAVE", 4)) { fclose(f); return -1; }
+	int fmt = 0, ch = 0, rate = 0, bits = 0; long dataPos = -1; u32 dataSz = 0;
+	while (fread(id, 1, 4, f) == 4 && fread(&sz, 4, 1, f) == 1) {
+		if (!memcmp(id, "fmt ", 4)) {
+			u8 b[40]; u32 r = sz < 40 ? sz : 40;
+			if (fread(b, 1, r, f) != r) break;
+			fmt = b[0] | b[1] << 8; ch = b[2] | b[3] << 8; rate = b[4] | b[5] << 8 | b[6] << 16 | b[7] << 24; bits = b[14] | b[15] << 8;
+			if (fmt == 0xFFFE && r >= 26) fmt = b[24] | b[25] << 8;
+			fseek(f, sz - r + (sz & 1), SEEK_CUR);
+		} else if (!memcmp(id, "data", 4)) { dataPos = ftell(f); dataSz = sz; break; }
+		else fseek(f, sz + (sz & 1), SEEK_CUR);
+	}
+	*err = "UNSUPPORTED WAV";
+	if (dataPos < 0 || ch < 1 || ch > 8 || rate < 4000 || !(fmt == 1 || fmt == 3) || !(bits == 8 || bits == 16 || bits == 24 || bits == 32)) { fclose(f); return -1; }
+	int bpf = ch * bits / 8;
+	int frames = dataSz / bpf;
+	if (frames > rate * 60) frames = rate * 60;
+	int outN = (int)((double)frames * SR / rate);
+	if (outN < 2) { fclose(f); return -1; }
+	*err = "OUT OF MEMORY";
+	s16* mono = (s16*)malloc(frames * 2);
+	if (!mono) { fclose(f); return -1; }
+	u8* chunk = (u8*)malloc(4096 * bpf);
+	if (!chunk) { free(mono); fclose(f); return -1; }
+	fseek(f, dataPos, SEEK_SET);
+	int got = 0;
+	while (got < frames) {
+		int want = frames - got; if (want > 4096) want = 4096;
+		int r = fread(chunk, bpf, want, f); if (r <= 0) break;
+		for (int i = 0; i < r; i++) {
+			float acc = 0; u8* p = chunk + i * bpf;
+			for (int c = 0; c < ch; c++) {
+				float v = 0;
+				if (bits == 8) v = (p[0] - 128) / 128.0f;
+				else if (bits == 16) v = (s16)(p[0] | p[1] << 8) / 32768.0f;
+				else if (bits == 24) v = (s32)((p[0] << 8) | (p[1] << 16) | (p[2] << 24)) / 2147483648.0f;
+				else if (fmt == 3) { float fv; memcpy(&fv, p, 4); v = fv; }
+				else v = (s32)(p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24) / 2147483648.0f;
+				acc += v; p += bits / 8;
 			}
-	free(img);
-	return ok;
-}
-
-static int saveWAV(const char* path, const s16* d, int n) {
-	FILE* f = fopen(path, "wb"); if (!f) return 0;
-	u8 h[44]; memcpy(h, "RIFF", 4); put32(h + 4, 36 + n * 2); memcpy(h + 8, "WAVEfmt ", 8);
-	put32(h + 16, 16); put16(h + 20, 1); put16(h + 22, 1); put32(h + 24, SR); put32(h + 28, SR * 2);
-	put16(h + 32, 2); put16(h + 34, 16); memcpy(h + 36, "data", 4); put32(h + 40, n * 2);
-	fwrite(h, 1, 44, f); fwrite(d, 2, n, f); fclose(f); return 1;
-}
-
-#define PAT_MAGIC 0x50544150
-typedef struct {
-	u32 magic, ver;
-	int root, scale, tapeMode, tapeDir, tapeSync, grainSrc, tempo;
-	float tp[6], gp[6], loopS, loopE, swing;
-	Step seq[NTR][NSTEP];
-	float trTune[NTR], trDecay[NTR];
-	u8 trMute[NTR];
-	int smpLen, smpS, smpE;
-} PatFile;
-
-static int savePatch(int id) {
-	char path[64]; snprintf(path, sizeof(path), PT_DIR "/P%04d.pat", id);
-	FILE* f = fopen(path, "wb"); if (!f) return 0;
-	PatFile pf; memset(&pf, 0, sizeof(pf));
-	pf.magic = PAT_MAGIC; pf.ver = 1; pf.root = P.root; pf.scale = P.scale; pf.tapeMode = tapeMode;
-	pf.tapeDir = tapeDir; pf.tapeSync = tapeSync; pf.grainSrc = grainSrc; pf.tempo = tempo;
-	memcpy(pf.tp, tp, sizeof(tp)); memcpy(pf.gp, gp, sizeof(gp));
-	pf.loopS = loopS; pf.loopE = loopE; pf.swing = swing;
-	memcpy(pf.seq, seq, sizeof(seq)); memcpy(pf.trTune, trTune, sizeof(trTune));
-	memcpy(pf.trDecay, trDecay, sizeof(trDecay)); memcpy(pf.trMute, trMute, sizeof(trMute));
-	pf.smpLen = smpLen; pf.smpS = smpS; pf.smpE = smpE;
-	fwrite(&pf, sizeof(pf), 1, f);
-	if (smpLen > 0) fwrite(smp, 2, smpLen, f);
-	fclose(f); return 1;
-}
-
-static int loadPatch(int id) {
-	char path[64]; snprintf(path, sizeof(path), PT_DIR "/P%04d.pat", id);
-	FILE* f = fopen(path, "rb"); if (!f) return 0;
-	PatFile pf;
-	if (fread(&pf, sizeof(pf), 1, f) != 1 || pf.magic != PAT_MAGIC) { fclose(f); return 0; }
-	audioHold(1);
-	P.root = ((pf.root % 12) + 12) % 12; P.scale = pf.scale & 7;
-	tapeMode = pf.tapeMode % TM_COUNT; tapeDir = pf.tapeDir < 0 ? -1 : 1; tapeSync = pf.tapeSync & 3;
-	grainSrc = pf.grainSrc & 1; tempo = pf.tempo < 40 || pf.tempo > 240 ? 96 : pf.tempo;
-	memcpy(tp, pf.tp, sizeof(tp)); memcpy(gp, pf.gp, sizeof(gp));
-	loopS = clampf(pf.loopS, 0, 1); loopE = clampf(pf.loopE, 0, 1); swing = clampf(pf.swing, 0, 0.6f);
-	memcpy(seq, pf.seq, sizeof(seq)); memcpy(trTune, pf.trTune, sizeof(trTune));
-	memcpy(trDecay, pf.trDecay, sizeof(trDecay)); memcpy(trMute, pf.trMute, sizeof(trMute));
-	if (pf.smpLen > 0 && pf.smpLen <= SMP_MAX && fread(smp, 2, pf.smpLen, f) == (size_t)pf.smpLen) {
-		smpLen = pf.smpLen;
-		smpS = pf.smpS >= 0 && pf.smpS < smpLen ? pf.smpS : 0;
-		smpE = pf.smpE > smpS && pf.smpE <= smpLen ? pf.smpE : smpLen;
+			acc /= ch; if (acc > 1) acc = 1; if (acc < -1) acc = -1;
+			mono[got + i] = (s16)(acc * 32767);
+		}
+		got += r;
 	}
-	for (int i = 0; i < NSMPV; i++) smpv[i].on = 0;
-	audioHold(0);
+	free(chunk); fclose(f);
+	frames = got; outN = (int)((double)frames * SR / rate);
+	int s = smpAlloc(outN, name);
+	if (s < 0) { free(mono); return -1; }
+	double ratio = (double)rate / SR;
+	for (int i = 0; i < outN; i++) {
+		double p = i * ratio; int p0 = (int)p; float fr = (float)(p - p0);
+		int p1 = p0 + 1 < frames ? p0 + 1 : p0;
+		smp[s].d[i] = (s16)(mono[p0] + (mono[p1] - mono[p0]) * fr);
+	}
+	free(mono);
+	*err = "";
+	return s;
+}
+
+// ================================================================ projects
+#define PROJ_MAGIC 0x31584250   // "PBX1"
+static void ensureDirs(void) {
+	mkdir("sdmc:/3ds", 0777); mkdir(PB_DIR, 0777); mkdir(PB_DIR "/samples", 0777); mkdir(PB_DIR "/projects", 0777);
+}
+static int projExists(int slot) {
+	char path[96]; snprintf(path, sizeof(path), PB_DIR "/projects/P%02d/project.bin", slot + 1);
+	FILE* f = fopen(path, "rb"); if (f) { fclose(f); return 1; } return 0;
+}
+static int projSave(int slot) {
+	ensureDirs();
+	char dir[80], path[112];
+	snprintf(dir, sizeof(dir), PB_DIR "/projects/P%02d", slot + 1); mkdir(dir, 0777);
+	snprintf(path, sizeof(path), "%s/project.bin", dir);
+	FILE* f = fopen(path, "wb"); if (!f) return 0;
+	u32 hdr[12] = {PROJ_MAGIC, (u32)bpmX10, (u32)swing, (u32)quantSel, (u32)metroSel, (u32)countIn, (u32)vintage, (u32)masterVol, (u32)fullLevel, 0, 0, 0};
+	fwrite(hdr, 4, 12, f);
+	for (int i = 0; i < MAXSMP; i++) { char nm[16]; memset(nm, 0, 16); if (smp[i].d) memcpy(nm, smp[i].name, 15); u8 used = smp[i].d ? 1 : 0; fwrite(&used, 1, 1, f); fwrite(nm, 1, 16, f); }
+	fwrite(pads, sizeof(Pad), NPADS, f);
+	fwrite(seqBars, 1, NSEQ, f);
+	for (int s = 0; s < NSEQ; s++) { fwrite(&seqN[s], 4, 1, f); fwrite(seqEv[s], sizeof(Event), seqN[s], f); }
 	fclose(f);
-	computeSmpPeaks();
+	for (int i = 0; i < MAXSMP; i++) {
+		snprintf(path, sizeof(path), "%s/s%03d.wav", dir, i);
+		if (smp[i].d) { if (!wavWrite(path, smp[i].d, smp[i].len)) return 0; }
+		else remove(path);
+	}
+	return 1;
+}
+static int projLoad(int slot) {
+	char dir[80], path[112];
+	snprintf(dir, sizeof(dir), PB_DIR "/projects/P%02d", slot + 1);
+	snprintf(path, sizeof(path), "%s/project.bin", dir);
+	FILE* f = fopen(path, "rb"); if (!f) return 0;
+	u32 hdr[12];
+	if (fread(hdr, 4, 12, f) != 12 || hdr[0] != PROJ_MAGIC) { fclose(f); return 0; }
+	for (int i = 0; i < MAXVOX; i++) vox[i].on = 0;
+	for (int i = 0; i < MAXSMP; i++) smpFreeSlot(i);
+	bpmX10 = hdr[1]; swing = hdr[2]; quantSel = hdr[3]; metroSel = hdr[4]; countIn = hdr[5]; vintage = hdr[6]; masterVol = hdr[7]; fullLevel = hdr[8];
+	u8 used[MAXSMP]; char names[MAXSMP][16];
+	for (int i = 0; i < MAXSMP; i++) { fread(&used[i], 1, 1, f); fread(names[i], 1, 16, f); names[i][15] = 0; }
+	fread(pads, sizeof(Pad), NPADS, f);
+	fread(seqBars, 1, NSEQ, f);
+	for (int s = 0; s < NSEQ; s++) {
+		int n = 0; fread(&n, 4, 1, f); if (n < 0 || n > MAXEV) n = 0;
+		seqN[s] = fread(seqEv[s], sizeof(Event), n, f);
+		if (seqBars[s] < 1 || seqBars[s] > 8) seqBars[s] = 1;
+	}
+	fclose(f);
+	// load samples into the same slots
+	for (int i = 0; i < MAXSMP; i++) if (used[i]) {
+		const char* err; snprintf(path, sizeof(path), "%s/s%03d.wav", dir, i);
+		int s = wavLoad(path, names[i], &err);
+		if (s >= 0 && s != i) {   // move into slot i
+			smp[i] = smp[s]; smp[s].d = NULL; smp[s].len = 0;
+		}
+	}
+	for (int p = 0; p < NPADS; p++) if (pads[p].smp >= 0 && (pads[p].smp >= MAXSMP || !smp[pads[p].smp].d)) pads[p].smp = -1;
+	undoN = -1;
 	return 1;
 }
 
-// library of saved photos
-static int lib[1000], libN = 0, libIdx = -1;
-static int cmpInt(const void* a, const void* b) { return *(const int*)a - *(const int*)b; }
-static void scanLib(void) {
-	libN = 0;
-	DIR* d = opendir(PT_DIR); if (!d) return;
-	struct dirent* e;
-	while ((e = readdir(d)) && libN < 1000) {
-		int id;
-		if ((e->d_name[0] == 'P') && sscanf(e->d_name, "P%d", &id) == 1 && (strstr(e->d_name, ".bmp") || strstr(e->d_name, ".BMP")))
-			lib[libN++] = id;
-	}
-	closedir(d);
-	qsort(lib, libN, sizeof(int), cmpInt);
-}
-static int nextPhotoId(void) { return libN ? lib[libN - 1] + 1 : 1; }
-
-static void onNewPhoto(void) {
-	analyzePhoto();
-	buildCaches();
-	audioHold(1); buildWavetables(); audioHold(0);
-	if (tapeMode == TM_MIC) tapeMode = TM_SPECTRAL;
-	if (photoId > 0) loadPatch(photoId);
-	renderTape();
-}
-
-// ---------------------------------------------------------------- patterns
-static void defaultPattern(void) {
-	memset(seq, 0, sizeof(seq));
-	for (int s = 0; s < NSTEP; s += 4) seq[T_KICK][s] = (Step){1, 12};
-	seq[T_KICK][10] = (Step){1, 7};
-	seq[T_SNARE][4] = (Step){1, 11}; seq[T_SNARE][12] = (Step){1, 11};
-	for (int s = 2; s < NSTEP; s += 4) seq[T_HAT][s] = (Step){1, 9};
-	seq[T_HAT][7] = (Step){1, 4}; seq[T_HAT][15] = (Step){1, 5};
-	seq[T_PERC][3] = (Step){1, 9}; seq[T_PERC][11] = (Step){1, 7};
-	seq[T_SYNTH][0] = (Step){1, 0}; seq[T_SYNTH][3] = (Step){1, 2}; seq[T_SYNTH][6] = (Step){1, 4}; seq[T_SYNTH][10] = (Step){1, 3};
-	seq[T_GRAIN][8] = (Step){1, 7};
-	for (int t = 0; t < NTR; t++) { trTune[t] = 0.5f; trDecay[t] = 0.5f; trMute[t] = 0; }
-	for (int s = 0; s < NSTEP; s++) { if (!seq[T_SAMPLE][s].on) seq[T_SAMPLE][s].val = 0; }
-	for (int t = T_SYNTH; t <= T_SAMPLE; t++) for (int s = 0; s < NSTEP; s++) if (!seq[t][s].on) seq[t][s].val = 0;
-	for (int t = 0; t < T_SYNTH; t++) for (int s = 0; s < NSTEP; s++) if (!seq[t][s].on) seq[t][s].val = 10;
-}
-
-static void genFromPhoto(int tr) {
-	static const int K[NTR] = {4, 2, 7, 3, 5, 3, 3};
-	float m[NSTEP]; int brightRow[NSTEP];
-	int y0 = tr * PH / NTR, y1 = (tr + 1) * PH / NTR;
-	for (int s = 0; s < NSTEP; s++) {
-		int sum = 0, cnt = 0, bv = -1; brightRow[s] = PH / 2;
-		for (int x = s * 25; x < s * 25 + 25; x += 2) {
-			for (int y = y0; y < y1; y++) { sum += luma[y][x]; cnt++; }
-			for (int y = 0; y < PH; y += 3) if (luma[y][x] > bv) { bv = luma[y][x]; brightRow[s] = y; }
-		}
-		m[s] = sum / (255.0f * cnt) + (frandM() * 0.02f);
-	}
-	audioHold(1);
-	for (int s = 0; s < NSTEP; s++) seq[tr][s].on = 0;
-	for (int k = 0; k < K[tr]; k++) {
-		int bi = -1; float bv = -1;
-		for (int s = 0; s < NSTEP; s++) if (!seq[tr][s].on && m[s] > bv) { bv = m[s]; bi = s; }
-		if (tr == T_KICK && k == 0) bi = 0;
-		if (bi < 0) break;
-		seq[tr][bi].on = 1;
-	}
-	for (int s = 0; s < NSTEP; s++) {
-		if (tr >= T_SYNTH) seq[tr][s].val = (s8)((int)((1.0f - (float)brightRow[s] / PH) * 11.0f) - 2);
-		else seq[tr][s].val = (s8)clampf(5 + m[s] * 10.0f, 1, 15);
-	}
-	audioHold(0);
-}
-
-// ---------------------------------------------------------------- camera
-static u16* camBuf; static u16* camFrame;
-static Handle camEvt = 0;
-static int camOn = 0, camReady = 0, camInner = 0;
-static u32 camXfer = 0;
-static u32 camSelect(void) { return camInner ? SELECT_IN1 : SELECT_OUT1; }
-static void camStart(void) {
-	if (camOn) return;
-	if (R_FAILED(camInit())) return;
-	u32 sel = camSelect();
-	CAMU_SetSize(sel, SIZE_CTR_TOP_LCD, CONTEXT_A);
-	CAMU_SetOutputFormat(sel, OUTPUT_RGB_565, CONTEXT_A);
-	CAMU_SetFrameRate(sel, FRAME_RATE_30);
-	CAMU_SetNoiseFilter(sel, true);
-	CAMU_SetAutoExposure(sel, true);
-	CAMU_SetAutoWhiteBalance(sel, true);
-	CAMU_SetTrimming(PORT_CAM1, false);
-	CAMU_GetMaxBytes(&camXfer, PW, PH);
-	CAMU_SetTransferBytes(PORT_CAM1, camXfer, PW, PH);
-	CAMU_Activate(sel);
-	CAMU_ClearBuffer(PORT_CAM1);
-	CAMU_StartCapture(PORT_CAM1);
-	camEvt = 0;
-	CAMU_SetReceiving(&camEvt, camBuf, PORT_CAM1, PW * PH * 2, (s16)camXfer);
-	camOn = 1; camReady = 0;
-}
-static void camStop(void) {
-	if (!camOn) return;
-	CAMU_StopCapture(PORT_CAM1);
-	if (camEvt) { svcCloseHandle(camEvt); camEvt = 0; }
-	CAMU_Activate(SELECT_NONE);
-	camExit();
-	camOn = 0; camReady = 0;
-}
-static void camPoll(void) {
-	if (!camOn || !camEvt) return;
-	if (svcWaitSynchronization(camEvt, 0) == 0) {
-		svcCloseHandle(camEvt); camEvt = 0;
-		memcpy(camFrame, camBuf, PW * PH * 2);
-		camReady = 1;
-		CAMU_SetReceiving(&camEvt, camBuf, PORT_CAM1, PW * PH * 2, (s16)camXfer);
+// remove samples no pad uses
+static void smpGC(int keep) {
+	for (int i = 0; i < MAXSMP; i++) {
+		if (!smp[i].d || i == keep) continue;
+		int used = 0;
+		for (int p = 0; p < NPADS; p++) if (pads[p].smp == i) { used = 1; break; }
+		if (!used) { voicesKillSample(i); smpFreeSlot(i); }
 	}
 }
-static inline void rgb565(u16 p, u8* r, u8* g, u8* b) {
-	*r = ((p >> 11) & 0x1F) << 3; *g = ((p >> 5) & 0x3F) << 2; *b = (p & 0x1F) << 3;
-}
 
-// ---------------------------------------------------------------- mic
-static u8* micBuf; static u32 micDataSize = 0, micLastOff = 0;
-static int micOK = 0, recording = 0, micGainIdx = 1;
-static float micLevel = 0;
-static const u8 MIC_GAINS[4] = {0x20, 0x40, 0x60, 0x7F};
+// ================================================================ drawing
+static u8* fb; static int fbW = 320;
+static u8* fontGfx;
 
-static void recStart(void) {
-	if (!micOK || recording) return;
-	MICU_SetGain(MIC_GAINS[micGainIdx]);
-	if (R_FAILED(MICU_StartSampling(MICU_ENCODING_PCM16_SIGNED, MICU_SAMPLE_RATE_32730, 0, micDataSize, true))) return;
-	micLastOff = micGetLastSampleOffset();
-	rawLen = 0; recording = 1;
-}
-static void recPoll(void) {
-	if (!recording) return;
-	u32 off = micGetLastSampleOffset();
-	float pk = 0;
-	while (micLastOff != off && rawLen < RAW_MAX) {
-		s16 s = *(s16*)(micBuf + micLastOff);
-		rawMic[rawLen++] = s;
-		float a = fabsf(s / 32768.0f); if (a > pk) pk = a;
-		micLastOff += 2; if (micLastOff >= micDataSize) micLastOff = 0;
-	}
-	micLevel = fmaxf(pk, micLevel * 0.85f);
-}
-static void pushUndo(void) {
-	memcpy(smpUndo, smp, smpLen * 2); smpUndoLen = smpLen; smpUndoS = smpS; smpUndoE = smpE; haveUndo = 1;
-}
-static int recStop(void) {
-	if (!recording) return 0;
-	MICU_StopSampling();
-	recording = 0; micLevel = 0;
-	int skip = 1000;   // drop the start-up click
-	if (rawLen < skip + 1000) return 0;
-	audioHold(1);
-	pushUndo();
-	float ratio = MIC_RATE / SR;
-	int n = (int)((rawLen - skip - 1) / ratio); if (n > SMP_MAX) n = SMP_MAX;
-	for (int i = 0; i < n; i++) {
-		float p = skip + i * ratio; int p0 = (int)p; float fr = p - p0;
-		smp[i] = (s16)(rawMic[p0] + (rawMic[p0 + 1] - rawMic[p0]) * fr);
-	}
-	smpLen = n; smpS = 0; smpE = n;
-	for (int i = 0; i < NSMPV; i++) smpv[i].on = 0;
-	audioHold(0);
-	computeSmpPeaks();
-	return 1;
-}
-
-// sample editor ops
-static void edTrim(void) {
-	if (smpE - smpS < 64) return;
-	audioHold(1); pushUndo();
-	int n = smpE - smpS; memmove(smp, smp + smpS, n * 2);
-	smpLen = n; smpS = 0; smpE = n;
-	for (int i = 0; i < NSMPV; i++) smpv[i].on = 0;
-	audioHold(0); computeSmpPeaks();
-}
-static void edNorm(void) {
-	if (smpE - smpS < 2) return;
-	audioHold(1); pushUndo();
-	int pk = 1; for (int i = smpS; i < smpE; i++) { int v = abs(smp[i]); if (v > pk) pk = v; }
-	float g = 31000.0f / pk;
-	for (int i = smpS; i < smpE; i++) smp[i] = (s16)clampf(smp[i] * g, -32767, 32767);
-	audioHold(0); computeSmpPeaks();
-}
-static void edRev(void) {
-	if (smpE - smpS < 2) return;
-	audioHold(1); pushUndo();
-	for (int a = smpS, b = smpE - 1; a < b; a++, b--) { s16 t = smp[a]; smp[a] = smp[b]; smp[b] = t; }
-	audioHold(0); computeSmpPeaks();
-}
-static void edFade(void) {
-	int n = smpE - smpS; if (n < 64) return;
-	audioHold(1); pushUndo();
-	int fi = SR / 200; if (fi > n / 4) fi = n / 4;
-	int fo = n * 3 / 10;
-	for (int i = 0; i < fi; i++) smp[smpS + i] = (s16)(smp[smpS + i] * (float)i / fi);
-	for (int i = 0; i < fo; i++) { float k = (float)i / fo; smp[smpE - 1 - i] = (s16)(smp[smpE - 1 - i] * k * k); }
-	audioHold(0); computeSmpPeaks();
-}
-static void edUndo(void) {
-	if (!haveUndo) return;
-	audioHold(1);
-	int n = smpLen > smpUndoLen ? smpLen : smpUndoLen;
-	for (int i = 0; i < n; i++) { s16 t = smp[i]; smp[i] = smpUndo[i]; smpUndo[i] = t; }
-	int l = smpLen, s = smpS, e = smpE;
-	smpLen = smpUndoLen; smpS = smpUndoS; smpE = smpUndoE;
-	smpUndoLen = l; smpUndoS = s; smpUndoE = e;
-	for (int i = 0; i < NSMPV; i++) smpv[i].on = 0;
-	audioHold(0); computeSmpPeaks();
-}
-
-// ---------------------------------------------------------------- drawing
-static u8* fb; static int fbW = 320; static u8* fontGfx;
-
-static inline void px(int x, int y, u8 r, u8 g, u8 b) {
-	if (x < 0 || x >= fbW || y < 0 || y >= 240) return;
-	u8* p = fb + (x * 240 + (239 - y)) * 3; p[0] = b; p[1] = g; p[2] = r;
-}
 static void rect(int x0, int y0, int w, int h, u8 r, u8 g, u8 b) {
-	int x1 = x0 + w, y1 = y0 + h;
-	if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > fbW) x1 = fbW; if (y1 > 240) y1 = 240;
-	if (x0 >= x1 || y0 >= y1) return;
-	for (int x = x0; x < x1; x++) {
-		u8* p = fb + (x * 240 + (240 - y1)) * 3;
-		for (int y = y0; y < y1; y++) { p[0] = b; p[1] = g; p[2] = r; p += 3; }
+	if (x0 < 0) { w += x0; x0 = 0; } if (y0 < 0) { h += y0; y0 = 0; }
+	if (x0 + w > fbW) w = fbW - x0; if (y0 + h > 240) h = 240 - y0;
+	if (w <= 0 || h <= 0) return;
+	for (int x = x0; x < x0 + w; x++) {
+		u8* p = fb + (x * 240 + (239 - y0)) * 3;
+		for (int y = 0; y < h; y++, p -= 3) { p[0] = b; p[1] = g; p[2] = r; }
 	}
 }
-static void blend(int x0, int y0, int w, int h, u8 r, u8 g, u8 b, int a) {
-	int x1 = x0 + w, y1 = y0 + h;
-	if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > fbW) x1 = fbW; if (y1 > 240) y1 = 240;
-	if (x0 >= x1 || y0 >= y1) return;
-	int ia = 256 - a;
-	for (int x = x0; x < x1; x++) {
-		u8* p = fb + (x * 240 + (240 - y1)) * 3;
-		for (int y = y0; y < y1; y++) {
-			p[0] = (p[0] * ia + b * a) >> 8; p[1] = (p[1] * ia + g * a) >> 8; p[2] = (p[2] * ia + r * a) >> 8; p += 3;
-		}
-	}
-}
-static void frame(int x, int y, int w, int h, u8 r, u8 g, u8 b) {
-	rect(x, y, w, 1, r, g, b); rect(x, y + h - 1, w, 1, r, g, b);
-	rect(x, y, 1, h, r, g, b); rect(x + w - 1, y, 1, h, r, g, b);
+static void frame(int x, int y, int w, int h, int t, u8 r, u8 g, u8 b) {
+	rect(x, y, w, t, r, g, b); rect(x, y + h - t, w, t, r, g, b);
+	rect(x, y, t, h, r, g, b); rect(x + w - t, y, t, h, r, g, b);
 }
 static void drawChar(int x, int y, char ch, int sc, u8 r, u8 g, u8 b) {
 	const u8* gl = fontGfx + ((u8)ch) * 8;
@@ -1080,414 +813,824 @@ static void drawChar(int x, int y, char ch, int sc, u8 r, u8 g, u8 b) {
 		for (int col = 0; col < 8; col++)
 			if (gl[row] & (0x80 >> col)) rect(x + col * sc, y + row * sc, sc, sc, r, g, b);
 }
-static void text(int x, int y, const char* s, int sc, u8 r, u8 g, u8 b) {
-	for (; *s; s++, x += 8 * sc) drawChar(x, y, *s, sc, r, g, b);
-}
-static void textC(int cx, int y, const char* s, int sc, u8 r, u8 g, u8 b) {
-	text(cx - (int)strlen(s) * 4 * sc, y, s, sc, r, g, b);
-}
-static void button(int x, int y, int w, int h, const char* label, int on) {
-	rect(x + 1, y + 1, w - 2, h - 2, on ? 230 : 46, on ? 120 : 42, on ? 60 : 52);
-	frame(x + 1, y + 1, w - 2, h - 2, 120, 110, 130);
-	textC(x + w / 2, y + h / 2 - 4, label, 1, 255, 255, 255);
-}
-static int inBox(int tx, int ty, int x, int y, int w, int h) { return tx >= x && tx < x + w && ty >= y && ty < y + h; }
+static void text(int x, int y, const char* s, int sc, u8 r, u8 g, u8 b) { for (; *s; s++, x += 8 * sc) drawChar(x, y, *s, sc, r, g, b); }
+static void textC(int cx, int y, const char* s, int sc, u8 r, u8 g, u8 b) { text(cx - (int)strlen(s) * 4 * sc, y, s, sc, r, g, b); }
+static void textR(int rx, int y, const char* s, int sc, u8 r, u8 g, u8 b) { text(rx - (int)strlen(s) * 8 * sc, y, s, sc, r, g, b); }
 
-// ---------------------------------------------------------------- UI state
-enum { PG_CAM, PG_TAPE, PG_GRAIN, PG_SEQ, PG_MIC, PG_KEYS, PG_COUNT };
-static const char* PG_NAMES[PG_COUNT] = {"CAM","TAPE","GRAIN","SEQ","MIC","KEYS"};
-static int page = PG_CAM;
+// LCD palette
+#define LCD_BG  168,186,140
+#define LCD_FG   28, 38, 26
+#define LCD_MID 120,140,100
+#define LCD_INV 210,224,180
+
+// ================================================================ UI state
+enum { PG_MAIN, PG_PROG, PG_STEP, PG_SMPL, PG_CHOP, PG_DISK, PG_COUNT };
+static const char* PG_NAMES[PG_COUNT] = {"MAIN","PROG","STEP","SMPL","CHOP","DISK"};
+static int page = PG_MAIN, bank = 0, selPad = 0, levels16 = 0, btnMode = 0;
+static int cursor[PG_COUNT];
+static int stepBar = 0, stepVel = 100;
 static char msg[48] = ""; static int msgT = 0;
-static void say(const char* s) { snprintf(msg, sizeof(msg), "%s", s); msgT = 120; }
-static int selTrack = 0, keysMode = 0, keysOct = 0, snapFlash = 0;
-static const char* KEYS_MODES[3] = {"SYNTH", "GRAIN", "SAMPLE"};
+static int topDirty = 1, padsDirty = 1, hdrDirty = 1;
+static float padFlash[16]; static float padShown[16];
 
-#define STRIP_Y 22
-#define STRIP_H 80
-#define SL_Y    106
-#define SL_H    22
+static void say(const char* m) { snprintf(msg, sizeof(msg), "%s", m); msgT = 150; topDirty = 1; }
 
-static void drawTabs(void) {
-	for (int i = 0; i < PG_COUNT; i++) {
-		int x = i * 53, w = (i == PG_COUNT - 1) ? 320 - x : 53;
-		rect(x, 0, w, 19, i == page ? 230 : 34, i == page ? 120 : 30, i == page ? 60 : 40);
-		rect(x + w - 1, 0, 1, 19, 10, 10, 12);
-		textC(x + w / 2, 6, PG_NAMES[i], 1, 255, 255, 255);
+// ---- sampling (mic)
+static u8* micBuf; static u32 micDataSize = 0, micLastOff = 0;
+static int micOK = 0, micGain = 2, recThresh = 0, recMaxS = 10, recNorm = 1;
+static int smplState = 0;   // 0 idle, 1 armed (waiting for threshold), 2 recording
+static s16* rawMic = NULL; static int rawLen = 0, rawMax = 0;
+static float micLevel = 0;
+static const u8 MIC_GAINS[4] = {0x18, 0x30, 0x50, 0x7F};
+
+// ---- chop
+static int chopSrc = 0, chopN = 8, chopAuto = 0, chopSens = 5, chopSel = 0, chopDest = 1, chopBars = 2;
+static int chopSt[17];
+
+static void chopCompute(void) {
+	Pad* p = &pads[chopSrc];
+	if (p->smp < 0) { chopN = chopN < 2 ? 2 : chopN; for (int i = 0; i <= chopN; i++) chopSt[i] = 0; return; }
+	int a = p->start, b = p->end, len = b - a;
+	if (len < chopN * 64) { for (int i = 0; i <= chopN; i++) chopSt[i] = a + len * i / chopN; return; }
+	if (!chopAuto) { for (int i = 0; i <= chopN; i++) chopSt[i] = a + (int)((long long)len * i / chopN); return; }
+	// transient detection on 256-sample hops
+	const s16* d = smp[p->smp].d;
+	int hop = 256, nh = len / hop;
+	float* E = (float*)malloc(nh * sizeof(float)); float* D = (float*)malloc(nh * sizeof(float));
+	if (!E || !D) { free(E); free(D); for (int i = 0; i <= chopN; i++) chopSt[i] = a + len * i / chopN; return; }
+	for (int h = 0; h < nh; h++) { float e = 0; const s16* q = d + a + h * hop; for (int i = 0; i < hop; i++) e += fabsf(q[i]); E[h] = e / hop; }
+	float mx = 1;
+	for (int h = 0; h < nh; h++) {
+		float m = 0; int c = 0; for (int j = h - 4; j < h; j++) if (j >= 0) { m += E[j]; c++; }
+		m = c ? m / c : 0; D[h] = E[h] - m * 1.1f; if (D[h] < 0) D[h] = 0; if (D[h] > mx) mx = D[h];
 	}
-}
-
-static void drawStrip(int showLoop) {
-	for (int y = 0; y < STRIP_H; y++)
-		for (int x = 0; x < 320; x++) {
-			const u8* c = stripCache[y][x];
-			px(x, STRIP_Y + y, c[0] >> 1, c[1] >> 1, c[2] >> 1);
+	float th = mx * (0.6f - chopSens * 0.055f);
+	int cnt = 1; chopSt[0] = a;
+	int minGap = (int)(0.07f * SR / hop);
+	// pick strongest peaks greedily
+	for (int k = 1; k < chopN; k++) {
+		int best = -1; float bv = th;
+		for (int h = 2; h < nh; h++) {
+			if (D[h] <= bv) continue;
+			int ok = 1;
+			for (int j = 0; j < cnt; j++) { int hh = (chopSt[j] - a) / hop; if (abs(hh - h) < minGap) { ok = 0; break; } }
+			if (ok) { bv = D[h]; best = h; }
 		}
-	int mid = STRIP_Y + STRIP_H / 2;
-	for (int x = 0; x < 320; x++) {
-		int h = tapePeak[x] * (STRIP_H / 2 - 2) / 128;
-		rect(x, mid - h, 1, h * 2 + 1, 240, 235, 220);
+		if (best < 0) break;
+		int pos = a + best * hop - 96; if (pos < a) pos = a;
+		chopSt[cnt++] = pos;
 	}
-	if (showLoop) {
-		int a = (int)(loopS * 320), b = (int)(loopE * 320);
-		blend(0, STRIP_Y, a, STRIP_H, 0, 0, 0, 170);
-		blend(b, STRIP_Y, 320 - b, STRIP_H, 0, 0, 0, 170);
-		rect(a, STRIP_Y, 2, STRIP_H, 255, 180, 60); rect(b - 2, STRIP_Y, 2, STRIP_H, 255, 180, 60);
-		int ph = (int)(tapePosFrac * 320);
-		if (tapeRun || tapeMul > 0) rect(ph, STRIP_Y, 2, STRIP_H, 120, 255, 200);
-	} else {
-		int gx = (int)(grainPos * 320);
-		rect(gx - 1, STRIP_Y, 3, STRIP_H, 200, 150, 255);
-		if (grainSrc == 1) text(4, STRIP_Y + 3, "SRC: MIC SAMPLE (X)", 1, 255, 200, 120);
-		for (int i = 0; i < MAXGR; i++) if (grainVisOn[i]) rect((int)(grainVisPos[i] * 320), STRIP_Y + 4 + (i * 7) % (STRIP_H - 8), 3, 3, 255, 255, 255);
-	}
-	frame(0, STRIP_Y, 320, STRIP_H, 90, 85, 100);
+	free(E); free(D);
+	// sort
+	for (int i = 1; i < cnt; i++) for (int j = i; j > 0 && chopSt[j] < chopSt[j - 1]; j--) { int t = chopSt[j]; chopSt[j] = chopSt[j - 1]; chopSt[j - 1] = t; }
+	chopN = cnt < 2 ? 2 : cnt;
+	if (cnt < 2) chopSt[1] = a + len / 2;
+	chopSt[chopN] = b;
+	if (chopSel >= chopN) chopSel = chopN - 1;
 }
 
-static void sliderValText(int pg, int i, char* o, int n) {
-	if (pg == PG_TAPE) {
+// ---- disk browser
+#define MAXFILES 256
+static char cwd[192] = PB_DIR "/samples";
+static char fileName[MAXFILES][64]; static u8 fileIsDir[MAXFILES]; static int fileCount = 0, fileSel = 0, fileTop = 0;
+static int projSlot = 0, confirmAct = 0;
+
+static int cmpFile(const void* a, const void* b) {
+	int ia = *(const int*)a, ib = *(const int*)b;
+	if (fileIsDir[ia] != fileIsDir[ib]) return fileIsDir[ib] - fileIsDir[ia];
+	return strcasecmp(fileName[ia], fileName[ib]);
+}
+static void scanDir(void) {
+	ensureDirs();
+	static char tn[MAXFILES][64]; static u8 td[MAXFILES]; int idx[MAXFILES];
+	int n = 0;
+	if (strcmp(cwd, "sdmc:/") != 0) { strcpy(tn[n], ".."); td[n] = 1; n++; }
+	DIR* dp = opendir(cwd);
+	if (dp) {
+		struct dirent* e;
+		while ((e = readdir(dp)) && n < MAXFILES) {
+			if (e->d_name[0] == '.') continue;
+			int isDir = e->d_type == DT_DIR;
+			int l = strlen(e->d_name);
+			if (!isDir && !(l > 4 && !strcasecmp(e->d_name + l - 4, ".wav"))) continue;
+			snprintf(tn[n], 64, "%s", e->d_name); td[n] = isDir; n++;
+		}
+		closedir(dp);
+	}
+	memcpy(fileName, tn, sizeof(tn)); memcpy(fileIsDir, td, sizeof(td));
+	int start = (n && !strcmp(fileName[0], "..")) ? 1 : 0;
+	for (int i = 0; i < n; i++) idx[i] = i;
+	qsort(idx + start, n - start, sizeof(int), cmpFile);
+	for (int i = 0; i < n; i++) { memcpy(tn[i], fileName[idx[i]], 64); td[i] = fileIsDir[idx[i]]; }
+	memcpy(fileName, tn, sizeof(tn)); memcpy(fileIsDir, td, sizeof(td));
+	fileCount = n; if (fileSel >= n) fileSel = n ? n - 1 : 0; fileTop = 0;
+}
+
+// ================================================================ fields
+static int fieldCount(int pg) {
+	switch (pg) {
+	case PG_MAIN: return 11;
+	case PG_PROG: return 15;
+	case PG_STEP: return 3;
+	case PG_SMPL: return 4;
+	case PG_CHOP: return 8;
+	default: return 1;
+	}
+}
+static void padLabel(int p, char* b) { snprintf(b, 8, "%c%02d", 'A' + p / 16, p % 16 + 1); }
+
+static void fieldText(int pg, int i, char* lab, char* val) {
+	Pad* p = &pads[selPad]; char pl[8];
+	val[0] = 0; lab[0] = 0;
+	switch (pg) {
+	case PG_MAIN:
 		switch (i) {
-		case 0:
-			if (tapeSync) snprintf(o, n, "%dBAR", SYNC_BARS[tapeSync]);
-			else snprintf(o, n, "%s%.2fx", tapeDir < 0 ? "-" : "", powf(2.0f, (tp[0] - 0.5f) * 4.0f));
-			break;
-		case 4: snprintf(o, n, "%dk", (int)(400.0f * powf(2.0f, tp[4] * 5.5f) / 1000.0f)); break;
-		default: snprintf(o, n, "%d%%", (int)(tp[i] * 100)); break;
+		case 0: strcpy(lab, "SEQ"); sprintf(val, "%02d", curSeq + 1); break;
+		case 1: strcpy(lab, "BPM"); sprintf(val, "%d.%d", bpmX10 / 10, bpmX10 % 10); break;
+		case 2: strcpy(lab, "BARS"); sprintf(val, "%d", seqBars[curSeq]); break;
+		case 3: strcpy(lab, "QUANT"); strcpy(val, QUANT_NAMES[quantSel]); break;
+		case 4: strcpy(lab, "SWING"); sprintf(val, "%d%%", swing); break;
+		case 5: strcpy(lab, "METRO"); strcpy(val, METRO_NAMES[metroSel]); break;
+		case 6: strcpy(lab, "COUNT IN"); strcpy(val, countIn ? "ON" : "OFF"); break;
+		case 7: strcpy(lab, "VINTAGE"); strcpy(val, VINT_NAMES[vintage]); break;
+		case 8: strcpy(lab, "VOLUME"); sprintf(val, "%d", masterVol); break;
+		case 9: strcpy(lab, "FULL LVL"); strcpy(val, fullLevel ? "ON" : "OFF"); break;
+		case 10: strcpy(lab, "DOUBLE"); strcpy(val, "PRESS >"); break;
 		}
-	} else {
+		break;
+	case PG_PROG:
 		switch (i) {
-		case 0: snprintf(o, n, "%dms", (int)(10.0f * powf(2.0f, gp[0] * 6.0f))); break;
-		case 1: snprintf(o, n, "%d/s", (int)(2.0f * powf(2.0f, gp[1] * 5.3f))); break;
-		case 3: snprintf(o, n, "%+dst", (int)roundf((gp[3] - 0.5f) * 48.0f)); break;
-		default: snprintf(o, n, "%d%%", (int)(gp[i] * 100)); break;
+		case 0: strcpy(lab, "PAD"); padLabel(selPad, pl); strcpy(val, pl); break;
+		case 1: strcpy(lab, "SAMPLE"); strcpy(val, p->smp >= 0 ? padSmpName(selPad) : "(EMPTY)"); break;
+		case 2: strcpy(lab, "LEVEL"); sprintf(val, "%d", p->level); break;
+		case 3: strcpy(lab, "PAN"); if (p->pan == 0) strcpy(val, "MID"); else sprintf(val, "%c%d", p->pan < 0 ? 'L' : 'R', abs(p->pan)); break;
+		case 4: strcpy(lab, "TUNE"); sprintf(val, "%+d", p->tune); break;
+		case 5: strcpy(lab, "FINE"); sprintf(val, "%+dc", p->fine); break;
+		case 6: strcpy(lab, "START"); sprintf(val, "%dms", (int)(p->start * 1000LL / SR)); break;
+		case 7: strcpy(lab, "END"); sprintf(val, "%dms", (int)(p->end * 1000LL / SR)); break;
+		case 8: strcpy(lab, "REVERSE"); strcpy(val, p->reverse ? "ON" : "OFF"); break;
+		case 9: strcpy(lab, "ATTACK"); sprintf(val, "%d", p->attack); break;
+		case 10: strcpy(lab, "DECAY"); if (p->decay >= 100) strcpy(val, "OFF"); else sprintf(val, "%d", p->decay); break;
+		case 11: strcpy(lab, "MODE"); strcpy(val, p->mode ? "NOTE ON" : "ONE SHOT"); break;
+		case 12: strcpy(lab, "MUTE GRP"); if (p->mgroup) sprintf(val, "%d", p->mgroup); else strcpy(val, "OFF"); break;
+		case 13: strcpy(lab, "CUTOFF"); if (p->cutoff >= 100) strcpy(val, "OPEN"); else sprintf(val, "%d", p->cutoff); break;
+		case 14: strcpy(lab, "RESO"); sprintf(val, "%d", p->reso); break;
 		}
+		break;
+	case PG_STEP:
+		switch (i) {
+		case 0: strcpy(lab, "BAR"); sprintf(val, "%d/%d", stepBar + 1, seqBars[curSeq]); break;
+		case 1: strcpy(lab, "PAD"); padLabel(selPad, pl); sprintf(val, "%s %.8s", pl, padSmpName(selPad)); break;
+		case 2: strcpy(lab, "VEL"); sprintf(val, "%d", stepVel); break;
+		}
+		break;
+	case PG_SMPL:
+		switch (i) {
+		case 0: strcpy(lab, "GAIN"); sprintf(val, "%d", micGain + 1); break;
+		case 1: strcpy(lab, "THRESH"); if (recThresh) sprintf(val, "%d%%", recThresh * 2); else strcpy(val, "OFF"); break;
+		case 2: strcpy(lab, "MAX LEN"); sprintf(val, "%ds", recMaxS); break;
+		case 3: strcpy(lab, "NORMALIZE"); strcpy(val, recNorm ? "ON" : "OFF"); break;
+		}
+		break;
+	case PG_CHOP:
+		switch (i) {
+		case 0: strcpy(lab, "SOURCE"); padLabel(chopSrc, pl); sprintf(val, "%s %.8s", pl, padSmpName(chopSrc)); break;
+		case 1: strcpy(lab, "SLICES"); sprintf(val, "%d", chopN); break;
+		case 2: strcpy(lab, "MODE"); strcpy(val, chopAuto ? "AUTO" : "EQUAL"); break;
+		case 3: strcpy(lab, "SENS"); sprintf(val, "%d", chopSens); break;
+		case 4: strcpy(lab, "SLICE"); sprintf(val, "%d", chopSel + 1); break;
+		case 5: strcpy(lab, "NUDGE"); sprintf(val, "%dms", (int)((chopSt[chopSel] - pads[chopSrc].start) * 1000LL / SR)); break;
+		case 6: strcpy(lab, "TO BANK"); sprintf(val, "%c", 'A' + chopDest); break;
+		case 7: strcpy(lab, "LOOP BARS"); sprintf(val, "%d", chopBars); break;
+		}
+		break;
 	}
 }
 
-static void drawSliders(int pg) {
-	float* v = pg == PG_TAPE ? tp : gp;
-	const char** names = pg == PG_TAPE ? TP_NAMES : GP_NAMES;
-	for (int i = 0; i < 6; i++) {
-		int y = SL_Y + i * SL_H;
-		rect(0, y, 320, SL_H - 1, 26, 24, 30);
-		text(4, y + 7, names[i], 1, 220, 215, 230);
-		rect(50, y + 6, 210, 10, 50, 46, 58);
-		rect(50, y + 6, (int)(v[i] * 210), 10, pg == PG_TAPE ? 230 : 160, pg == PG_TAPE ? 140 : 110, pg == PG_TAPE ? 60 : 240);
-		char s[16]; sliderValText(pg, i, s, sizeof(s));
-		text(266, y + 7, s, 1, 255, 255, 255);
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static void doubleSeq(void) {
+	int b = seqBars[curSeq];
+	if (b > 4) { say("MAX 8 BARS"); return; }
+	undoSnap();
+	int n = seqN[curSeq];
+	for (int i = 0; i < n; i++) { Event e = seqEv[curSeq][i]; if (e.tick < (u32)(b * TPB)) evInsert(curSeq, e.tick + b * TPB, e.pad, e.trans, e.vel, e.len, 0); }
+	seqBars[curSeq] = b * 2; seqResync();
+	say("DOUBLED");
+}
+
+static void fieldChange(int pg, int i, int d, int big) {
+	Pad* p = &pads[selPad];
+	switch (pg) {
+	case PG_MAIN:
+		switch (i) {
+		case 0: curSeq = clampi(curSeq + d, 0, NSEQ - 1); if (seqBars[curSeq] < 1) seqBars[curSeq] = 2;
+			if (songTick >= seqLen()) { songTick = fmod(songTick, seqLen()); lastTick = (int)songTick; }
+			seqResync(); stepBar = 0; break;
+		case 1: bpmX10 = clampi(bpmX10 + d * (big ? 100 : 10), 300, 3000); break;
+		case 2: seqBars[curSeq] = clampi(seqBars[curSeq] + d, 1, 8);
+			if (songTick >= seqLen()) { songTick = 0; lastTick = -1; }
+			seqResync(); if (stepBar >= seqBars[curSeq]) stepBar = 0; break;
+		case 3: quantSel = clampi(quantSel + d, 0, 6); break;
+		case 4: swing = clampi(swing + d * (big ? 4 : 1), 50, 75); break;
+		case 5: metroSel = (metroSel + d + 3) % 3; break;
+		case 6: countIn ^= 1; break;
+		case 7: vintage = (vintage + d + 4) % 4; break;
+		case 8: masterVol = clampi(masterVol + d * (big ? 10 : 2), 0, 100); break;
+		case 9: fullLevel ^= 1; break;
+		case 10: if (d > 0) doubleSeq(); break;
+		}
+		break;
+	case PG_PROG: {
+		int len = p->smp >= 0 ? smp[p->smp].len : 0;
+		int st = big ? SR / 100 : SR / 1000;
+		switch (i) {
+		case 0: selPad = clampi(selPad + d, 0, NPADS - 1); bank = selPad / 16; padsDirty = hdrDirty = 1; break;
+		case 1: {   // cycle through loaded samples
+			int s = p->smp;
+			for (int k = 0; k < MAXSMP; k++) { s = (s + d + MAXSMP) % MAXSMP; if (smp[s].d) break; }
+			if (s >= 0 && smp[s].d) { padAssign(selPad, s); padsDirty = 1; }
+			break; }
+		case 2: p->level = clampi(p->level + d * (big ? 10 : 1), 0, 100); break;
+		case 3: p->pan = clampi(p->pan + d * (big ? 10 : 1), -50, 50); break;
+		case 4: p->tune = clampi(p->tune + d * (big ? 12 : 1), -36, 36); break;
+		case 5: p->fine = clampi(p->fine + d * (big ? 10 : 1), -50, 50); break;
+		case 6: p->start = clampi(p->start + d * st, 0, p->end - 64 > 0 ? p->end - 64 : 0); break;
+		case 7: p->end = clampi(p->end + d * st, p->start + 64, len); break;
+		case 8: p->reverse ^= 1; break;
+		case 9: p->attack = clampi(p->attack + d * (big ? 10 : 1), 0, 100); break;
+		case 10: p->decay = clampi(p->decay + d * (big ? 10 : 1), 0, 100); break;
+		case 11: p->mode ^= 1; break;
+		case 12: p->mgroup = clampi(p->mgroup + d, 0, 8); break;
+		case 13: p->cutoff = clampi(p->cutoff + d * (big ? 10 : 1), 0, 100); break;
+		case 14: p->reso = clampi(p->reso + d * (big ? 10 : 1), 0, 100); break;
+		}
+		break; }
+	case PG_STEP:
+		switch (i) {
+		case 0: stepBar = clampi(stepBar + d, 0, seqBars[curSeq] - 1); break;
+		case 1: selPad = clampi(selPad + d, 0, NPADS - 1); bank = selPad / 16; hdrDirty = 1; break;
+		case 2: stepVel = clampi(stepVel + d * (big ? 10 : 1), 1, 127); break;
+		}
+		padsDirty = 1;
+		break;
+	case PG_SMPL:
+		switch (i) {
+		case 0: micGain = clampi(micGain + d, 0, 3); break;
+		case 1: recThresh = clampi(recThresh + d, 0, 25); break;
+		case 2: recMaxS = clampi(recMaxS + d * (big ? 5 : 1), 1, 30); break;
+		case 3: recNorm ^= 1; break;
+		}
+		break;
+	case PG_CHOP:
+		switch (i) {
+		case 0: chopSrc = clampi(chopSrc + d, 0, NPADS - 1); chopSel = 0; chopCompute(); break;
+		case 1: chopN = clampi(chopN + d, 2, 16); chopCompute(); break;
+		case 2: chopAuto ^= 1; chopCompute(); break;
+		case 3: chopSens = clampi(chopSens + d, 1, 10); if (chopAuto) chopCompute(); break;
+		case 4: chopSel = clampi(chopSel + d, 0, chopN - 1); break;
+		case 5: if (chopSel > 0) { int s = big ? SR / 1000 : SR / 200; chopSt[chopSel] = clampi(chopSt[chopSel] + d * s, chopSt[chopSel - 1] + 64, chopSt[chopSel + 1] - 64); } break;
+		case 6: chopDest = clampi(chopDest + d, 0, 3); break;
+		case 7: chopBars = clampi(chopBars * (d > 0 ? 2 : 1) / (d < 0 ? 2 : 1), 1, 8); break;
+		}
+		padsDirty = 1;
+		break;
+	}
+	topDirty = 1;
+}
+
+// ================================================================ top screen pages
+static void drawWave(int x0, int y0, int w, int h, int pi, int a, int b, int markA, int markB, const int* marks, int nm, int sel) {
+	rect(x0, y0, w, h, LCD_BG);
+	frame(x0, y0, w, h, 1, LCD_MID);
+	int s = pads[pi].smp;
+	if (s < 0 || !smp[s].d || b - a < 2) { textC(x0 + w / 2, y0 + h / 2 - 4, "NO SAMPLE", 1, LCD_MID); return; }
+	const s16* d = smp[s].d;
+	int mid = y0 + h / 2, hh = h / 2 - 3;
+	for (int x = 0; x < w - 2; x++) {
+		int i0 = a + (int)((long long)(b - a) * x / (w - 2)), i1 = a + (int)((long long)(b - a) * (x + 1) / (w - 2));
+		if (i1 <= i0) i1 = i0 + 1;
+		int mn = 0, mx = 0, stp = (i1 - i0) > 64 ? (i1 - i0) / 64 : 1;
+		for (int i = i0; i < i1; i += stp) { int v = d[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+		int y1 = mid - mx * hh / 32768, y2 = mid - mn * hh / 32768;
+		int inside = (markA < 0) || (i0 >= markA && i0 < markB);
+		if (inside) rect(x0 + 1 + x, y1, 1, y2 - y1 + 1, LCD_FG); else rect(x0 + 1 + x, y1, 1, y2 - y1 + 1, LCD_MID);
+	}
+	for (int m = 0; m < nm; m++) {
+		int x = x0 + 1 + (int)((long long)(marks[m] - a) * (w - 2) / (b - a));
+		char t[4]; snprintf(t, 4, "%d", m + 1);
+		if (m == sel) { rect(x, y0 + 1, 2, h - 2, 200, 40, 30); text(x + 3, y0 + 3, t, 1, 200, 40, 30); }
+		else { rect(x, y0 + 1, 1, h - 2, LCD_FG); text(x + 3, y0 + 3, t, 1, LCD_FG); }
 	}
 }
 
-static void drawBottomCam(void) {
+static void topHeader(void) {
+	rect(0, 0, 400, 20, 40, 44, 40);
+	text(6, 6, "PADBOX", 1, 230, 160, 60);
+	text(64, 6, PG_NAMES[page], 1, 210, 224, 180);
+	int L = seqLen();
+	int t = playState == 2 ? (int)songTick : 0;
+	if (t >= L) t = 0;
 	char b[64];
-	rect(0, 20, 320, 220, 18, 16, 22);
-	if (photoId) snprintf(b, sizeof(b), "PATCH P%04d", photoId); else snprintf(b, sizeof(b), "PATCH (built-in)");
-	text(8, 26, b, 2, 255, 220, 160);
-	snprintf(b, sizeof(b), "KEY  %s %s", NOTE_NAMES[P.root], SCALES[P.scale].name); text(8, 48, b, 1, 230, 230, 240);
-	snprintf(b, sizeof(b), "TAPE %s  %.1fs", TM_NAMES[tapeMode], tapeLen / (float)SR); text(8, 60, b, 1, 230, 230, 240);
-	snprintf(b, sizeof(b), "KICK %d>%dHz  SNR %dHz  HAT %dHz", (int)P.kickF0, (int)P.kickF1, (int)P.snTone, (int)P.hatBase); text(8, 72, b, 1, 200, 200, 210);
-	snprintf(b, sizeof(b), "SYN A%.2f D%.2f S%.2f R%.2f", P.synA, P.synD, P.synS, P.synR); text(8, 84, b, 1, 200, 200, 210);
-	snprintf(b, sizeof(b), "    CUT %dHz RES %d%% MOVE %d%%", (int)P.synCut, (int)(P.synRes * 100), (int)(P.synMove * 100)); text(8, 96, b, 1, 200, 200, 210);
-	snprintf(b, sizeof(b), "LUM %d%% SAT %d%% CON %d%% EDGE %d%%", (int)(P.lum * 100), (int)(P.sat * 100), (int)(P.contrast * 100), (int)(P.edge * 100)); text(8, 108, b, 1, 160, 160, 175);
-	snprintf(b, sizeof(b), "LIBRARY %d/%d", libIdx + 2, libN + 1); text(8, 124, b, 1, 160, 160, 175);
-	for (int i = 0; i < 6; i++) { int sw = 320 / 6; rect(i * sw + 2, 136, sw - 4, 8, photo[120][i * 66 + 30][0], photo[120][i * 66 + 30][1], photo[120][i * 66 + 30][2]); }
-	button(0, 150, 80, 46, "<<", 0);
-	button(80, 150, 160, 46, camOn ? "SNAP (A)" : "CAMERA...", 1);
-	button(240, 150, 80, 46, ">>", 0);
-	snprintf(b, sizeof(b), "%s (Y)", TM_NAMES[tapeMode]);
-	button(0, 200, 106, 38, b, 0);
-	button(106, 200, 107, 38, "SAVE (B)", 0);
-	button(213, 200, 107, 38, camInner ? "INNER (X)" : "OUTER (X)", 0);
+	snprintf(b, sizeof(b), "SEQ%02d %03d.%d.%02d %d.%d", curSeq + 1, t / TPB + 1, (t % TPB) / PPQ + 1, (t % PPQ) * 100 / PPQ, bpmX10 / 10, bpmX10 % 10);
+	text(110, 6, b, 1, 210, 224, 180);
+	const char* st = playState == 1 ? "COUNT" : (playState == 2 ? "PLAY" : "STOP");
+	rect(318, 3, 40, 14, playState ? 40 : 60, playState ? 140 : 60, playState ? 60 : 60);
+	textC(338, 6, st, 1, 255, 255, 255);
+	rect(360, 3, 36, 14, recOn ? 210 : 70, recOn ? 40 : 60, recOn ? 30 : 60);
+	textC(378, 6, "REC", 1, 255, 255, 255);
 }
 
-static void drawBottomSeq(void) {
-	rect(0, 20, 320, 220, 18, 16, 22);
-	for (int t = 0; t < NTR; t++) {
-		int y = 22 + t * 16;
-		const u8* c = TR_COL[t];
-		if (t == selTrack) rect(0, y, 31, 15, c[0], c[1], c[2]);
-		text(4, y + 4, TR_SHORT[t], 1, t == selTrack ? 0 : (trMute[t] ? 90 : c[0]), t == selTrack ? 0 : (trMute[t] ? 90 : c[1]), t == selTrack ? 0 : (trMute[t] ? 90 : c[2]));
-		for (int s = 0; s < NSTEP; s++) {
-			int x = 32 + s * 18;
-			int beat = (s % 4 == 0);
-			u8 br = seq[t][s].on ? 255 : (beat ? 56 : 40);
-			if (seq[t][s].on) {
-				float k = trMute[t] ? 0.3f : (0.45f + 0.55f * (t < T_SYNTH ? seq[t][s].val / 15.0f : 1.0f));
-				rect(x + 1, y + 1, 16, 13, c[0] * k, c[1] * k, c[2] * k);
-			} else rect(x + 1, y + 1, 16, 13, br, br, br + 6);
-			if (playing && s == curStep) frame(x, y, 18, 15, 255, 255, 255);
+static void topFooter(void) {
+	rect(0, 226, 400, 14, 40, 44, 40);
+	const char* h = "";
+	if (msgT > 0) { text(6, 229, msg, 1, 255, 200, 90); return; }
+	switch (page) {
+	case PG_MAIN: h = "A:REC X:UNDO B+PAD:ERASE R+PAD:REPEAT"; break;
+	case PG_PROG: h = "TAP PADS TO SELECT  L+D-PAD: BIG STEPS"; break;
+	case PG_STEP: h = "PADS = 16 STEPS OF THE BAR  L+PAD: PICK"; break;
+	case PG_SMPL: h = micOK ? "A: RECORD / STOP  -> SELECTED PAD" : "MIC UNAVAILABLE"; break;
+	case PG_CHOP: h = "A: SLICES->PADS  X: BPM FROM LOOP"; break;
+	case PG_DISK: h = "A:LOAD B:SAVE PAD X:SAVE PRJ Y:LOAD PRJ"; break;
+	}
+	text(6, 229, h, 1, 170, 180, 150);
+}
+
+static void drawFields(int y0, int cols) {
+	int n = fieldCount(page), rows = (n + cols - 1) / cols;
+	int cw = 400 / cols;
+	for (int i = 0; i < n; i++) {
+		int c = i / rows, r = i % rows;
+		int x = 4 + c * cw, y = y0 + r * 12;
+		char lab[24], val[32]; fieldText(page, i, lab, val);
+		int sel = cursor[page] == i;
+		if (sel) rect(x - 2, y - 2, cw - 6, 12, LCD_FG);
+		if (sel) { text(x, y, lab, 1, LCD_INV); textR(x + cw - 12, y, val, 1, LCD_INV); }
+		else { text(x, y, lab, 1, LCD_MID); textR(x + cw - 12, y, val, 1, LCD_FG); }
+	}
+}
+
+// sequence overview (MAIN)
+#define OV_X 8
+#define OV_Y 152
+#define OV_W 384
+#define OV_H 70
+static int ovPlayX = -1;
+static void drawOverview(void) {
+	rect(OV_X, OV_Y, OV_W, OV_H, LCD_BG);
+	int L = seqLen();
+	for (int b = 0; b <= seqBars[curSeq] * 4; b++) {
+		int x = OV_X + b * (OV_W - 1) / (seqBars[curSeq] * 4);
+		rect(x, OV_Y, 1, OV_H, (b % 4 == 0) ? 28 : 120, (b % 4 == 0) ? 38 : 140, (b % 4 == 0) ? 26 : 100);
+	}
+	// rows: pads of the current bank (16 rows x 4px), others marked in a 6px strip at the bottom
+	for (int i = 0; i < seqN[curSeq]; i++) {
+		Event* e = &seqEv[curSeq][i];
+		if (e->tick >= (u32)L) continue;
+		int x = OV_X + (int)((long long)e->tick * (OV_W - 1) / L);
+		int y;
+		if (e->pad / 16 == bank) y = OV_Y + 1 + (15 - e->pad % 16) * 4; else y = OV_Y + 65;
+		int w = 2 + e->vel / 64;
+		rect(x, y, w, 3, e->pad == selPad ? 200 : 28, e->pad == selPad ? 40 : 38, e->pad == selPad ? 30 : 26);
+	}
+	ovPlayX = -1;
+}
+
+static void drawStepGrid(void) {
+	int gx = 40, gy = 44, cw = 22, ch = 11;
+	rect(0, gy - 2, 400, 16 * ch + 4, LCD_BG);
+	int t0 = stepBar * TPB;
+	int ph = (playState == 2) ? (((int)songTick - t0) / 240) : -1;
+	for (int r = 0; r < 16; r++) {
+		int pi = bank * 16 + 15 - r;
+		char pl[8]; padLabel(pi, pl);
+		int sel = pi == selPad;
+		if (sel) rect(0, gy + r * ch, 38, ch - 1, LCD_FG);
+		text(4, gy + r * ch + 1, pl, 1, sel ? 210 : 28, sel ? 224 : 38, sel ? 180 : 26);
+		for (int s = 0; s < 16; s++) {
+			int x = gx + s * cw, y = gy + r * ch;
+			int on = 0, vel = 0;
+			int lo = lowerBound(curSeq, t0 + s * 240);
+			for (int k = lo; k < seqN[curSeq] && seqEv[curSeq][k].tick < (u32)(t0 + s * 240 + 240); k++)
+				if (seqEv[curSeq][k].pad == pi) { on = 1; vel = seqEv[curSeq][k].vel; }
+			u8 cr = 150, cg = 168, cb = 124;
+			if (s % 4 == 0) { cr = 140; cg = 158; cb = 114; }
+			if (s == ph) { cr = 200; cg = 210; cb = 160; }
+			rect(x, y, cw - 2, ch - 2, cr, cg, cb);
+			if (on) {
+				int w = 4 + (cw - 8) * vel / 127;
+				rect(x + 2, y + 2, w, ch - 6, sel ? 200 : 28, sel ? 40 : 38, sel ? 30 : 26);
+			}
 		}
 	}
-	// lane
-	int ly = 138, lh = 80;
-	rect(32, ly, 288, lh, 30, 28, 36);
-	const u8* c = TR_COL[selTrack];
-	for (int s = 0; s < NSTEP; s++) {
-		int x = 32 + s * 18, v = seq[selTrack][s].val;
-		int h;
-		if (selTrack >= T_SYNTH) h = (v + 7) * (lh - 4) / 21; else h = v * (lh - 4) / 15;
-		if (h < 2) h = 2;
-		float k = seq[selTrack][s].on ? 1.0f : 0.35f;
-		rect(x + 2, ly + lh - h, 14, h, c[0] * k, c[1] * k, c[2] * k);
-	}
-	if (selTrack >= T_SYNTH) { int zy = ly + lh - 7 * (lh - 4) / 21; rect(32, zy, 288, 1, 120, 120, 130); }
-	text(2, ly + 4, selTrack >= T_SYNTH ? "NOTE" : "VEL", 1, 200, 200, 210);
-	char b[64];
-	snprintf(b, sizeof(b), "T%d", (int)(trTune[selTrack] * 100)); text(2, ly + 30, b, 1, 160, 160, 170);
-	snprintf(b, sizeof(b), "D%d", (int)(trDecay[selTrack] * 100)); text(2, ly + 42, b, 1, 160, 160, 170);
-	snprintf(b, sizeof(b), "%s BPM %d SWING %d%%  %s", playing ? ">" : "#", tempo, (int)(swing * 100), trMute[selTrack] ? "MUTED" : "");
-	text(4, 226, b, 1, 255, 230, 200);
 }
 
-static void drawBottomMic(void) {
-	rect(0, 20, 320, 220, 18, 16, 22);
-	int wy = 22, wh = 100, mid = wy + wh / 2;
-	rect(0, wy, 320, wh, 28, 26, 34);
-	if (recording) {
-		int lv = (int)(micLevel * 320);
-		rect(0, wy, lv, wh, 160, 40, 40);
-		textC(160, mid - 8, "RECORDING", 2, 255, 255, 255);
-		char b[32]; snprintf(b, sizeof(b), "%.1fs", rawLen / MIC_RATE); textC(160, mid + 12, b, 1, 255, 220, 220);
-	} else if (smpLen > 0) {
-		for (int x = 0; x < 320; x++) {
-			int p = smpPeak[x * 400 / 320];
-			int h = p * (wh / 2 - 2) / 128;
-			rect(x, mid - h, 1, h * 2 + 1, 240, 120, 190);
-		}
-		int a = (int)((long long)smpS * 320 / smpLen), b = (int)((long long)smpE * 320 / smpLen);
-		blend(0, wy, a, wh, 0, 0, 0, 170); blend(b, wy, 320 - b, wh, 0, 0, 0, 170);
-		rect(a, wy, 2, wh, 255, 220, 80); rect(b - 2, wy, 2, wh, 255, 220, 80);
-		char s[48]; snprintf(s, sizeof(s), "%.2fs / %.2fs", (smpE - smpS) / (float)SR, smpLen / (float)SR); text(4, wy + 3, s, 1, 255, 255, 255);
-	} else textC(160, mid - 4, micOK ? "PRESS A OR REC TO RECORD" : "MIC UNAVAILABLE", 1, 200, 200, 210);
-	frame(0, wy, 320, wh, 90, 85, 100);
-	button(0, 128, 80, 34, recording ? "STOP" : "REC (A)", recording);
-	button(80, 128, 80, 34, "PLAY (B)", 0);
-	button(160, 128, 80, 34, "TRIM", 0);
-	button(240, 128, 80, 34, "NORM", 0);
-	button(0, 164, 80, 34, "REVERSE", 0);
-	button(80, 164, 80, 34, "FADE", 0);
-	button(160, 164, 80, 34, "UNDO", 0);
-	button(240, 164, 80, 34, ">TAPE", tapeMode == TM_MIC);
-	char g[24]; snprintf(g, sizeof(g), "GAIN %d", micGainIdx + 1);
-	button(0, 200, 106, 38, "SAVE WAV", 0);
-	button(106, 200, 107, 38, grainSrc ? "GRAIN:MIC" : "GRAIN:TAPE", grainSrc);
-	button(213, 200, 107, 38, g, 0);
-}
-
-static int keysHeldPad = -1;
-static void drawBottomKeys(void) {
-	rect(0, 20, 320, 220, 18, 16, 22);
-	int n = SCALES[P.scale].n;
-	for (int i = 0; i < 16; i++) {
-		int col = i % 8, row = i / 8;
-		int x = col * 40, y = 22 + (1 - row) * 50;
-		int deg = i + keysOct * n;
-		int semi = degSemi(deg);
-		int pc = ((P.root + semi) % 12 + 12) % 12;
-		int isRoot = (((deg % n) + n) % n) == 0;
-		const u8* c = TR_COL[keysMode == 0 ? T_SYNTH : (keysMode == 1 ? T_GRAIN : T_SAMPLE)];
-		float k = i == keysHeldPad ? 1.0f : (isRoot ? 0.6f : 0.35f);
-		rect(x + 2, y + 2, 36, 46, c[0] * k, c[1] * k, c[2] * k);
-		textC(x + 20, y + 20, NOTE_NAMES[pc], 1, 255, 255, 255);
-	}
-	for (int d = 0; d < 4; d++) {
-		const u8* c = TR_COL[d];
-		rect(d * 80 + 2, 126, 76, 54, c[0] * 0.5f, c[1] * 0.5f, c[2] * 0.5f);
-		textC(d * 80 + 40, 149, TR_LONG[d], 1, 255, 255, 255);
-	}
-	for (int m = 0; m < 3; m++) button(m * 106, 184, m == 2 ? 108 : 106, 32, KEYS_MODES[m], keysMode == m);
-	char b[64]; snprintf(b, sizeof(b), "OCT %+d (UP/DN)  HOLD R = REC TO SEQ", keysOct);
-	text(4, 224, b, 1, 220, 215, 230);
+static int lastMeterW = -1;
+static void drawSmplLive(void) {
+	int w = (int)(micLevel * 380); if (w > 380) w = 380;
+	if (w == lastMeterW) return;
+	lastMeterW = w;
+	rect(10, 104, 380, 14, LCD_MID);
+	rect(10, 104, w, 14, micLevel > 0.95f ? 200 : 28, micLevel > 0.95f ? 40 : 38, micLevel > 0.95f ? 30 : 26);
+	if (recThresh) { int tx = 10 + recThresh * 2 * 380 / 100; rect(tx, 100, 2, 22, 200, 40, 30); }
 }
 
 static void drawTop(void) {
 	fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL); fbW = 400;
-	char b[80];
-	if (page == PG_CAM && camOn && camReady) {
-		for (int x = 0; x < PW; x++) {
-			u8* p = fb + x * 240 * 3;
-			int sx = camInner ? PW - 1 - x : x;
-			for (int y = PH - 1; y >= 0; y--) {
-				u8 r, g, bb; rgb565(camFrame[y * PW + sx], &r, &g, &bb);
-				p[0] = bb; p[1] = g; p[2] = r; p += 3;
-			}
-		}
-	} else memcpy(fb, (page == PG_GRAIN || page == PG_SEQ || page == PG_MIC || page == PG_KEYS) ? topDim : topCache, PW * PH * 3);
-
-	if (snapFlash > 0) { blend(0, 0, 400, 240, 255, 255, 255, snapFlash * 20); snapFlash--; }
-
+	rect(0, 20, 400, 206, LCD_BG);
+	topHeader();
 	switch (page) {
-	case PG_CAM:
-		if (!camOn) textC(200, 110, "CAMERA OFF", 2, 255, 255, 255);
+	case PG_MAIN:
+		drawFields(28, 2);
+		drawOverview();
 		break;
-	case PG_TAPE: {
-		int a = (int)(loopS * 400), e = (int)(loopE * 400);
-		blend(0, 0, a, 240, 0, 0, 0, 150); blend(e, 0, 400 - e, 240, 0, 0, 0, 150);
-		if (tapeRun || tapeMul > 0) rect((int)(tapePosFrac * 400), 0, 2, 240, 120, 255, 200);
+	case PG_PROG: {
+		drawFields(26, 2);
+		Pad* p = &pads[selPad];
+		int len = p->smp >= 0 ? smp[p->smp].len : 0;
+		drawWave(8, 124, 384, 98, selPad, 0, len, p->start, p->end, NULL, 0, -1);
+		if (len) {
+			int xs = 9 + (int)((long long)p->start * 382 / len), xe = 9 + (int)((long long)p->end * 382 / len);
+			rect(xs, 124, 2, 98, 200, 40, 30); rect(xe - 2, 124, 2, 98, 200, 40, 30);
+		}
 		break; }
-	case PG_GRAIN:
-		rect((int)(grainPos * 400), 0, 1, 240, 200, 150, 255);
-		for (int i = 0; i < MAXGR; i++) if (grainVisOn[i]) {
-			int gx = (int)(grainVisPos[i] * 400), gy = 30 + (i * 37) % 180;
-			rect(gx - 2, gy - 2, 5, 5, 255, 255, 255);
-		}
+	case PG_STEP:
+		drawFields(26, 3);
+		drawStepGrid();
 		break;
-	case PG_SEQ:
-		if (playing && curStep >= 0) blend(curStep * 25, 0, 25, 240, 255, 255, 255, 60);
-		for (int t = 0; t < NTR; t++) {
-			int y = 22 + t * 26; const u8* c = TR_COL[t];
-			snprintf(b, sizeof(b), "%-6s TUNE %3d DEC %3d %s", TR_LONG[t], (int)(trTune[t] * 100), (int)(trDecay[t] * 100), trMute[t] ? "MUTE" : "");
-			if (t == selTrack) blend(0, y - 3, 400, 14, c[0], c[1], c[2], 90);
-			text(8, y, b, 1, c[0], c[1], c[2]);
-		}
-		break;
-	case PG_MIC: {
-		if (smpLen > 0 && !recording) {
-			for (int x = 0; x < 400; x++) { int h = smpPeak[x] * 70 / 128; rect(x, 120 - h, 1, h * 2 + 1, 240, 120, 190); }
-			int a = (int)((long long)smpS * 400 / smpLen), e = (int)((long long)smpE * 400 / smpLen);
-			rect(a, 30, 2, 180, 255, 220, 80); rect(e - 2, 30, 2, 180, 255, 220, 80);
-		}
-		if (recording) { rect(20, 110, (int)(micLevel * 360), 20, 255, 60, 60); textC(200, 80, "REC", 3, 255, 80, 80); }
+	case PG_SMPL: {
+		drawFields(26, 2);
+		char b[64];
+		if (smplState == 1) textC(200, 80, "ARMED - WAITING FOR SOUND", 1, LCD_FG);
+		else if (smplState == 2) { snprintf(b, sizeof(b), "RECORDING %.1fs", rawLen / MIC_RATE); textC(200, 76, b, 2, 200, 40, 30); }
+		else { char pl[8]; padLabel(selPad, pl); snprintf(b, sizeof(b), "A TO SAMPLE INTO PAD %s", pl); textC(200, 80, b, 1, LCD_FG); }
+		lastMeterW = -1; drawSmplLive();
+		Pad* p = &pads[selPad];
+		drawWave(8, 126, 384, 96, selPad, p->start, p->end, -1, 0, NULL, 0, -1);
 		break; }
-	case PG_KEYS:
-		snprintf(b, sizeof(b), "%s %s", NOTE_NAMES[P.root], SCALES[P.scale].name); textC(200, 70, b, 3, 255, 230, 180);
-		snprintf(b, sizeof(b), "PADS PLAY %s", KEYS_MODES[keysMode]); textC(200, 110, b, 2, 255, 255, 255);
-		{
-			int n = SCALES[P.scale].n; char s[64] = "";
-			for (int i = 0; i < n; i++) { strcat(s, NOTE_NAMES[(P.root + SCALES[P.scale].iv[i]) % 12]); strcat(s, " "); }
-			textC(200, 140, s, 1, 230, 230, 240);
+	case PG_CHOP: {
+		drawFields(26, 2);
+		Pad* p = &pads[chopSrc];
+		drawWave(8, 82, 384, 140, chopSrc, p->start, p->end > p->start ? p->end : p->start + 1, -1, 0, chopSt, chopN, chopSel);
+		break; }
+	case PG_DISK: {
+		char b[64];
+		snprintf(b, sizeof(b), "PROJECT P%02d %s", projSlot + 1, projExists(projSlot) ? "(SAVED)" : "(EMPTY)");
+		rect(2, 24, 396, 12, LCD_FG); text(6, 26, b, 1, LCD_INV); textR(394, 26, "< >", 1, LCD_INV);
+		snprintf(b, sizeof(b), "%.48s", cwd + 5);
+		text(6, 40, b, 1, LCD_MID);
+		if (fileSel < fileTop) fileTop = fileSel;
+		if (fileSel >= fileTop + 14) fileTop = fileSel - 13;
+		for (int i = 0; i < 14 && fileTop + i < fileCount; i++) {
+			int k = fileTop + i, y = 54 + i * 12;
+			if (k == fileSel) rect(2, y - 2, 396, 12, LCD_FG);
+			snprintf(b, sizeof(b), "%s%.46s", fileIsDir[k] ? "/" : " ", fileName[k]);
+			text(6, y, b, 1, k == fileSel ? 210 : 28, k == fileSel ? 224 : 38, k == fileSel ? 180 : 26);
 		}
-		break;
+		if (!fileCount) text(6, 54, "NO WAV FILES HERE", 1, LCD_MID);
+		snprintf(b, sizeof(b), "MEM %d.%dMB/%dMB", poolBytes / 1048576, (poolBytes % 1048576) * 10 / 1048576, POOL_LIMIT / 1048576);
+		textR(394, 40, b, 1, LCD_MID);
+		break; }
 	}
-
-	// header
-	blend(0, 0, 400, 12, 0, 0, 0, 170);
-	if (photoId) snprintf(b, sizeof(b), "PHOTOTAPE P%04d %s %s", photoId, NOTE_NAMES[P.root], SCALES[P.scale].name);
-	else snprintf(b, sizeof(b), "PHOTOTAPE  %s %s", NOTE_NAMES[P.root], SCALES[P.scale].name);
-	text(3, 2, b, 1, 255, 230, 190);
-	snprintf(b, sizeof(b), "%s%3dBPM %2d", playing ? ">" : "#", tempo, playing ? curStep + 1 : 0);
-	text(400 - 3 - (int)strlen(b) * 8, 2, b, 1, playing ? 120 : 200, 255, playing ? 160 : 200);
-	if (playing) for (int s = 0; s < NSTEP; s++) rect(220 + s * 6, 4, 4, 4, s == curStep ? 255 : 80, s == curStep ? 255 : 80, 90);
-
-	// footer hints
-	static const char* H1[PG_COUNT] = {
-		"A SNAP  X FLIP CAM  Y TAPE MODE  B SAVE PATCH",
-		"A PLAY/STOP  B REVERSE  Y SYNC  X FULL LOOP",
-		"TOUCH STRIP=PLAY  A/R LATCH  X SOURCE",
-		"TAP GRID  L/R TRACK  A MUTE  B HEAR  X PHOTO-GEN",
-		"A REC  B PLAY  L/R NUDGE START  ZL/ZR END",
-		"PADS PLAY  R+PLAY=REC  UP/DN OCT  Y MODE",
-	};
-	static const char* H2[PG_COUNT] = {
-		"<</>> BROWSE PHOTOS  UP/DN ROOT",
-		"DRAG STRIP=LOOP  TAP=JUMP",
-		"SLIDE ON STRIP TO SCRUB THE PHOTO",
-		"STICK TUNE/DECAY  UP/DN BPM  LEFT/RIGHT SWING",
-		"DRAG WAVE=SET START/END  D-PAD NUDGE",
-		"DRUM PADS ALWAYS LIVE",
-	};
-	blend(0, 218, 400, 22, 0, 0, 0, 170);
-	text(3, 220, H1[page], 1, 230, 230, 240);
-	text(3, 230, H2[page], 1, 170, 170, 185);
-	if (msgT > 0) {
-		msgT--;
-		int w = strlen(msg) * 16 + 16;
-		rect(200 - w / 2, 96, w, 28, 230, 120, 60);
-		textC(200, 102, msg, 2, 255, 255, 255);
-	}
+	topFooter();
 }
 
-// ---------------------------------------------------------------- actions
-static void loadLibIdx(void) {
-	if (libIdx < 0) { photoId = 0; genDefaultPhoto(); onNewPhoto(); say("BUILT-IN"); return; }
-	int id = lib[libIdx];
-	char path[64]; snprintf(path, sizeof(path), PT_DIR "/P%04d.bmp", id);
-	if (!loadBMP(path)) { say("LOAD FAILED"); return; }
-	photoId = id; onNewPhoto();
-	char s[24]; snprintf(s, sizeof(s), "P%04d", id); say(s);
-}
-
-static void doSnap(void) {
-	if (!camOn || !camReady) return;
-	for (int y = 0; y < PH; y++)
-		for (int x = 0; x < PW; x++) {
-			int sx = camInner ? PW - 1 - x : x;
-			rgb565(camFrame[y * PW + sx], &photo[y][x][0], &photo[y][x][1], &photo[y][x][2]);
+static int lastHdrT = -1, lastStepPh = -2;
+static void drawTopLive(void) {
+	fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL); fbW = 400;
+	int t = playState == 2 ? (int)songTick : 0;
+	int ht = t / 24;
+	if (ht != lastHdrT) { topHeader(); lastHdrT = ht; }
+	if (page == PG_MAIN) {
+		int L = seqLen();
+		int x = playState == 2 ? OV_X + (int)((long long)(t % L) * (OV_W - 1) / L) : -1;
+		if (x != ovPlayX) {
+			if (ovPlayX >= 0 || x < 0) drawOverview();
+			if (x >= 0) rect(x, OV_Y, 1, OV_H, 200, 40, 30);
+			ovPlayX = x;
 		}
-	snapFlash = 10;
-	ensureDir();
-	scanLib();
-	int id = nextPhotoId();
-	char path[64]; snprintf(path, sizeof(path), PT_DIR "/P%04d.bmp", id);
-	int ok = saveBMP(path);
-	photoId = ok ? id : 0;
-	analyzePhoto(); buildCaches();
-	audioHold(1); buildWavetables(); audioHold(0);
-	if (tapeMode == TM_MIC) tapeMode = TM_SPECTRAL;
-	renderTape();
-	if (ok) { scanLib(); for (int i = 0; i < libN; i++) if (lib[i] == id) libIdx = i; savePatch(id); }
-	char s[24]; snprintf(s, sizeof(s), ok ? "SNAP P%04d" : "SNAP (NOT SAVED)", id); say(s);
+	} else if (page == PG_STEP) {
+		int ph = playState == 2 ? ((t - stepBar * TPB) / 240) : -1;
+		if (ph != lastStepPh) { drawStepGrid(); lastStepPh = ph; padsDirty = 1; }
+	} else if (page == PG_SMPL) drawSmplLive();
+	if (msgT > 0 && --msgT == 0) topFooter();
 }
 
-static void doSavePatch(void) {
-	ensureDir();
-	if (!photoId) {
-		scanLib(); int id = nextPhotoId();
-		char path[64]; snprintf(path, sizeof(path), PT_DIR "/P%04d.bmp", id);
-		if (!saveBMP(path)) { say("SAVE FAILED"); return; }
-		photoId = id; scanLib(); for (int i = 0; i < libN; i++) if (lib[i] == id) libIdx = i;
+// ================================================================ bottom screen
+#define HDR_H 20
+static void padRect(int k, int* x, int* y) {   // k = 0..15 in MPC order (0 bottom-left)
+	int col = k % 4, row = 3 - k / 4;
+	*x = col * 80; *y = HDR_H + row * 55;
+}
+static void stepRect(int s, int* x, int* y) {  // reading order
+	*x = (s % 4) * 80; *y = HDR_H + (s / 4) * 55;
+}
+
+static void drawHeader(void) {
+	fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL); fbW = 320;
+	rect(0, 0, 320, HDR_H, 26, 26, 28);
+	for (int i = 0; i < PG_COUNT; i++) {
+		int x = i * 40, a = i == page;
+		rect(x + 1, 1, 38, HDR_H - 2, a ? 230 : 48, a ? 150 : 48, a ? 50 : 52);
+		textC(x + 20, 6, PG_NAMES[i], 1, a ? 20 : 200, a ? 20 : 200, a ? 20 : 200);
 	}
-	if (savePatch(photoId)) { char s[24]; snprintf(s, sizeof(s), "SAVED P%04d", photoId); say(s); }
+	char b[4] = {(char)('A' + bank), 0};
+	rect(241, 1, 22, HDR_H - 2, 70, 110, 160); textC(252, 6, b, 1, 255, 255, 255);
+	rect(265, 1, 26, HDR_H - 2, btnMode ? 60 : 48, btnMode ? 160 : 48, btnMode ? 90 : 52); textC(278, 6, "BTN", 1, 230, 230, 230);
+	rect(293, 1, 26, HDR_H - 2, levels16 ? 170 : 48, levels16 ? 70 : 48, levels16 ? 170 : 52); textC(306, 6, "16L", 1, 230, 230, 230);
+}
+
+static void drawPad(int k) {
+	fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL); fbW = 320;
+	int x, y;
+	if (page == PG_STEP) {
+		stepRect(k, &x, &y);
+		int t0 = stepBar * TPB + k * 240, on = 0, vel = 0;
+		int lo = lowerBound(curSeq, t0);
+		for (int i = lo; i < seqN[curSeq] && seqEv[curSeq][i].tick < (u32)(t0 + 240); i++)
+			if (seqEv[curSeq][i].pad == selPad) { on = 1; vel = seqEv[curSeq][i].vel; }
+		int ph = playState == 2 && ((int)songTick / 240) == stepBar * 16 + k;
+		u8 r = 58, g = 58, b = 62;
+		if (k % 4 == 0) { r = 70; g = 70; b = 76; }
+		if (on) { r = 220; g = 120; b = 40; }
+		if (ph) { r = on ? 255 : 120; g = on ? 200 : 120; b = on ? 120 : 130; }
+		rect(x + 2, y + 2, 76, 51, r, g, b);
+		char t[8]; snprintf(t, 8, "%d", k + 1);
+		text(x + 6, y + 6, t, 1, on ? 30 : 180, on ? 20 : 180, on ? 10 : 180);
+		if (on) { rect(x + 6, y + 44, 68 * vel / 127, 4, 60, 30, 10); }
+		return;
+	}
+	padRect(k, &x, &y);
+	int pi = bank * 16 + k;
+	float f = padShown[k];
+	u8 r = 72 + (u8)(f * 170), g = 72 + (u8)(f * 40), b = 76 - (u8)(f * 40);
+	rect(x + 2, y + 2, 76, 51, r, g, b);
+	int sel = (page == PG_CHOP) ? 0 : (pi == selPad && !levels16);
+	if (levels16 && k == 0) sel = 1;
+	if (sel) frame(x + 2, y + 2, 76, 51, 2, 255, 190, 60);
+	char t[24];
+	if (page == PG_CHOP) {
+		if (k < chopN) { snprintf(t, sizeof(t), "SLICE %d", k + 1); text(x + 6, y + 6, t, 1, 230, 230, 230); }
+		if (k == chopSel) frame(x + 2, y + 2, 76, 51, 2, 255, 90, 60);
+		return;
+	}
+	if (levels16) {
+		snprintf(t, sizeof(t), "%+d", pads[selPad].tune + k); text(x + 6, y + 6, t, 1, 230, 230, 230);
+		text(x + 6, y + 40, "16 LVL", 1, 200, 150, 220);
+		return;
+	}
+	padLabel(pi, t); text(x + 6, y + 6, t, 1, 150, 150, 155);
+	if (btnMode && k < 9) {
+		static const char* BTN[9] = {"<", "v", ">", "^", "Y", "B", "A", "X", "L"};
+		textR(x + 74, y + 6, BTN[k], 1, 120, 220, 140);
+	}
+	char nm[16]; snprintf(nm, sizeof(nm), "%.9s", padSmpName(pi));
+	text(x + 6, y + 36, nm, 1, 235, 235, 235);
+}
+
+static void drawPads(void) { for (int k = 0; k < 16; k++) drawPad(k); }
+
+// ================================================================ actions
+static int lockHeld = 0;
+static void lock(void) { LightLock_Lock(&alock); lockHeld = 1; }
+static void unlock(void) { LightLock_Unlock(&alock); lockHeld = 0; }
+
+static void transportToggle(void) {
+	lock();
+	if (playState) {
+		playState = 0;
+		for (int i = 0; i < MAXVOX; i++) if (vox[i].on && vox[i].noteOn) vox[i].stage = 2;
+		npend = 0;
+	} else {
+		songTick = 0; lastTick = -1; evIdx = 0; npend = 0;
+		for (int i = 0; i < seqN[curSeq]; i++) seqEv[curSeq][i].flags = 0;
+		if (recOn && countIn) { playState = 1; ciTick = 0; clickMetro(1); }
+		else playState = 2;
+		recPassArmed = 1;
+	}
+	unlock();
+	topDirty = hdrDirty = 1; padsDirty = 1;
+}
+
+static void eraseCurrentPad(int pi) {
+	lock();
+	undoSnap();
+	int n = 0;
+	for (int i = seqN[curSeq] - 1; i >= 0; i--) if (seqEv[curSeq][i].pad == pi) { evDelete(curSeq, i); n++; }
+	unlock();
+	char b[32], pl[8]; padLabel(pi, pl); snprintf(b, sizeof(b), "ERASED %s (%d)", pl, n); say(b);
+}
+
+// physical pad k (0-15) pressed with velocity vel. slot = hold slot index
+static void padDown(int k, int vel, int slot, u32 kHeld) {
+	int pi = bank * 16 + k, trans = 0;
+	if (page == PG_STEP) {
+		if (kHeld & KEY_L) { selPad = bank * 16 + (3 - k / 4) * 4 + k % 4; topDirty = padsDirty = 1; return; }
+		// toggle step k of current bar for selPad (k here is reading order)
+		int t0 = stepBar * TPB + k * 240, found = 0;
+		lock();
+		undoSnap();
+		for (int i = seqN[curSeq] - 1; i >= 0; i--) {
+			Event* e = &seqEv[curSeq][i];
+			if (e->pad == selPad && e->tick >= (u32)t0 && e->tick < (u32)(t0 + 240)) { evDelete(curSeq, i); found = 1; }
+		}
+		if (!found) { evInsert(curSeq, t0, selPad, 0, stepVel, 240, 0); voiceStart(selPad, 0, stepVel, ticksToSamples(240), 0); }
+		unlock();
+		topDirty = padsDirty = 1;
+		return;
+	}
+	if (page == PG_CHOP) {
+		if (k < chopN && pads[chopSrc].smp >= 0) {
+			chopSel = k;
+			Pad save = pads[chopSrc];
+			lock();
+			pads[chopSrc].start = chopSt[k]; pads[chopSrc].end = chopSt[k + 1]; pads[chopSrc].reverse = 0;
+			voiceStart(chopSrc, 0, 127, 0, 0);
+			pads[chopSrc] = save;
+			unlock();
+			padFlash[k] = 1; topDirty = 1; padsDirty = 1;
+		}
+		return;
+	}
+	if (kHeld & KEY_B) { eraseCurrentPad(levels16 ? selPad : pi); return; }
+	if (levels16) { trans = k; pi = selPad; }
+	else if (kHeld & KEY_L) { selPad = pi; topDirty = padsDirty = 1; if (page == PG_CHOP) { chopSrc = pi; chopCompute(); } return; }
+	else if (selPad != pi) { selPad = pi; padsDirty = 1; if (page == PG_PROG || page == PG_SMPL || page == PG_STEP) topDirty = 1; }
+	Hold* h = &hold[slot];
+	lock();
+	h->on = 1; h->pad = pi; h->trans = trans; h->vel = vel; h->evTick = -1;
+	h->lastRep = repeatOn ? (playState == 2 ? lastTick : (lastFree & ((1 << 20) - 1))) : -100000;
+	voiceStart(pi, trans, vel, -1, slot + 1);
+	recordHit(pi, trans, vel, 240, h);
+	unlock();
+	padFlash[k] = vel / 127.0f;
+	if (page == PG_MAIN) topDirty = 1;
+}
+
+static void padUp(int slot) {
+	Hold* h = &hold[slot];
+	if (!h->on) return;
+	lock();
+	voiceReleaseHold(slot + 1);
+	if (h->evTick >= 0 && playState == 2) {
+		int L = seqLen();
+		int len = (((int)songTick - h->pressTick) % L + L) % L;
+		if (len < 30) len = 30; if (len > 65000) len = 65000;
+		for (int i = lowerBound(curSeq, h->evTick); i < seqN[curSeq] && seqEv[curSeq][i].tick == (u32)h->evTick; i++)
+			if (seqEv[curSeq][i].pad == h->pad && seqEv[curSeq][i].trans == h->trans) seqEv[curSeq][i].len = len;
+	}
+	h->on = 0;
+	unlock();
+}
+
+static void chopConvert(void) {
+	Pad* src = &pads[chopSrc];
+	if (src->smp < 0) { say("NO SAMPLE TO CHOP"); return; }
+	Pad base = *src;
+	lock();
+	for (int i = 0; i < chopN && i < 16; i++) {
+		Pad* p = &pads[chopDest * 16 + i];
+		*p = base;
+		p->start = chopSt[i]; p->end = chopSt[i + 1]; p->reverse = 0; p->mgroup = 0;
+	}
+	smpGC(-1);
+	unlock();
+	bank = chopDest;
+	char b[40]; snprintf(b, sizeof(b), "%d SLICES -> BANK %c", chopN, 'A' + chopDest); say(b);
+	hdrDirty = padsDirty = 1;
+}
+
+static void chopBpm(void) {
+	Pad* p = &pads[chopSrc];
+	if (p->smp < 0) return;
+	float secs = (float)(p->end - p->start) / SR;
+	if (secs < 0.2f) return;
+	float b = chopBars * 4 * 60.0f / secs;
+	while (b > 200) b /= 2;
+	while (b < 50) b *= 2;
+	bpmX10 = (int)(b * 10 + 0.5f);
+	char m[40]; snprintf(m, sizeof(m), "BPM %d.%d (%d BARS)", bpmX10 / 10, bpmX10 % 10, chopBars); say(m);
+}
+
+// ---- mic
+static void micPoll(void) {
+	if (!smplState) return;
+	u32 off = micGetLastSampleOffset();
+	float pk = 0;
+	while (micLastOff != off) {
+		s16 s = *(s16*)(micBuf + micLastOff);
+		micLastOff += 2; if (micLastOff >= micDataSize) micLastOff = 0;
+		float a = fabsf(s / 32768.0f); if (a > pk) pk = a;
+		if (smplState == 1) {
+			if (!recThresh || a >= recThresh * 0.02f) { smplState = 2; rawLen = 0; topDirty = 1; }
+			else continue;
+		}
+		if (rawLen < rawMax) rawMic[rawLen++] = s;
+	}
+	micLevel = pk > micLevel ? pk : micLevel * 0.85f;
+	static int lastSec = -1;
+	if (smplState == 2) { int s10 = (int)(rawLen / MIC_RATE * 10); if (s10 != lastSec) { lastSec = s10; topDirty = 1; } }
+}
+static void smplStart(void) {
+	if (!micOK) { say("MIC UNAVAILABLE"); return; }
+	rawMax = (int)(recMaxS * MIC_RATE);
+	free(rawMic); rawMic = (s16*)malloc(rawMax * 2);
+	if (!rawMic) { say("OUT OF MEMORY"); return; }
+	MICU_SetGain(MIC_GAINS[micGain]);
+	if (R_FAILED(MICU_StartSampling(MICU_ENCODING_PCM16_SIGNED, MICU_SAMPLE_RATE_32730, 0, micDataSize, true))) { say("MIC ERROR"); return; }
+	micLastOff = micGetLastSampleOffset();
+	rawLen = 0; smplState = recThresh ? 1 : 2; micLevel = 0;
+	topDirty = 1;
+}
+static void smplStop(void) {
+	if (!smplState) return;
+	MICU_StopSampling();
+	int st = smplState; smplState = 0; micLevel = 0; topDirty = 1;
+	int skip = (st == 2 && !recThresh) ? 1200 : 0;   // drop the start-up click
+	if (rawLen < skip + 800) { say("TOO SHORT"); free(rawMic); rawMic = NULL; return; }
+	float ratio = MIC_RATE / SR;
+	int n = (int)((rawLen - skip - 1) / ratio);
+	static int take = 0; char nm[16]; snprintf(nm, sizeof(nm), "MIC %02d", ++take);
+	lock();
+	int s = smpAlloc(n, nm);
+	if (s < 0) { unlock(); say("OUT OF MEMORY"); free(rawMic); rawMic = NULL; return; }
+	float pk = 1;
+	for (int i = 0; i < n; i++) {
+		float p = skip + i * ratio; int p0 = (int)p; float fr = p - p0;
+		float v = rawMic[p0] + (rawMic[p0 + 1] - rawMic[p0]) * fr;
+		smp[s].d[i] = (s16)v; if (fabsf(v) > pk) pk = fabsf(v);
+	}
+	if (recNorm && pk > 64) { float g = 32000.0f / pk; for (int i = 0; i < n; i++) smp[s].d[i] = (s16)(smp[s].d[i] * g); }
+	padReset(&pads[selPad]); padAssign(selPad, s);
+	smpGC(-1);
+	unlock();
+	free(rawMic); rawMic = NULL;
+	char b[40], pl[8]; padLabel(selPad, pl); snprintf(b, sizeof(b), "SAMPLED %.1fs -> %s", n / (float)SR, pl); say(b);
+	padsDirty = 1;
+}
+
+// ---- disk
+static void diskLoadFile(void) {
+	if (!fileCount) return;
+	char path[288];
+	if (fileIsDir[fileSel]) {
+		if (!strcmp(fileName[fileSel], "..")) {
+			char* sl = strrchr(cwd, '/');
+			if (sl && sl > cwd + 5) *sl = 0; else strcpy(cwd, "sdmc:/");
+		} else {
+			snprintf(path, sizeof(path), "%s%s%s", cwd, cwd[strlen(cwd) - 1] == '/' ? "" : "/", fileName[fileSel]);
+			snprintf(cwd, sizeof(cwd), "%s", path);
+		}
+		fileSel = 0; scanDir(); topDirty = 1; return;
+	}
+	snprintf(path, sizeof(path), "%s/%s", cwd, fileName[fileSel]);
+	char nm[16]; snprintf(nm, sizeof(nm), "%s", fileName[fileSel]);
+	char* dot = strrchr(nm, '.'); if (dot) *dot = 0;
+	const char* err;
+	say("LOADING...");
+	int s = wavLoad(path, nm, &err);
+	if (s >= 0) { lock(); padReset(&pads[selPad]); padAssign(selPad, s); smpGC(-1); unlock(); }
+	if (s < 0) say(err);
+	else { char b[48], pl[8]; padLabel(selPad, pl); snprintf(b, sizeof(b), "%s -> %s", nm, pl); say(b); padsDirty = 1; }
+}
+static void diskSavePad(void) {
+	int s = pads[selPad].smp;
+	if (s < 0) { say("PAD IS EMPTY"); return; }
+	ensureDirs();
+	Pad* p = &pads[selPad];
+	char path[96]; int n = 0; FILE* f;
+	do { n++; snprintf(path, sizeof(path), PB_DIR "/samples/%.10s_%03d.wav", smp[s].name, n); for (char* c = path + strlen(PB_DIR) + 9; *c; c++) if (*c == ' ' || *c == '/') *c = '_'; f = fopen(path, "rb"); if (f) fclose(f); } while (f && n < 999);
+	int a = p->start, b = p->end > smp[s].len ? smp[s].len : p->end;
+	if (wavWrite(path, smp[s].d + a, b - a)) { say(strrchr(path, '/') + 1); if (!strcmp(cwd, PB_DIR "/samples")) scanDir(); }
 	else say("SAVE FAILED");
 }
 
-static void keysRecord(int tr, int val) {
-	if (!playing || curStep < 0) return;
-	int s = curStep; if (stepFrac > 0.5f) s = (s + 1) % NSTEP;
-	seq[tr][s].on = 1; seq[tr][s].val = (s8)val;
-}
-
-// ---------------------------------------------------------------- main
-int main(void) {
+// ================================================================ main
+int main(int argc, char** argv) {
 	gfxInitDefault();
+	gfxSetDoubleBuffering(GFX_TOP, false);
+	gfxSetDoubleBuffering(GFX_BOTTOM, false);
 	fontGfx = consoleGetDefault()->font.gfx;
 	osSetSpeedupEnable(true);
-	srand(osGetTime()); rngMain ^= (u32)osGetTime(); rngAud ^= (u32)(osGetTime() * 7);
+	hidSetRepeatParameters(18, 4);
+	LightLock_Init(&alock);
 
-	for (int i = 0; i <= 4096; i++) sinT[i] = sinf(TWO_PI_F * i / 4096.0f);
-	for (int i = 0; i <= 1024; i++) hannT[i] = 0.5f - 0.5f * cosf(TWO_PI_F * i / 1024.0f);
+	for (int i = 0; i < NPADS; i++) padReset(&pads[i]);
+	for (int s = 0; s < NSEQ; s++) seqBars[s] = 2;
+	buildKits();
+	demoSeq();
+	ensureDirs();
+	scanDir();
 
-	topCache = (u8*)malloc(PW * PH * 3);
-	topDim = (u8*)malloc(PW * PH * 3);
-	wtab = (float*)malloc(NTAB * TABN * sizeof(float));
-	tape = (s16*)malloc(TAPE_MAX * 2);
-	smp = (s16*)calloc(SMP_MAX, 2);
-	smpUndo = (s16*)calloc(SMP_MAX, 2);
-	rawMic = (s16*)malloc(RAW_MAX * 2 + 16);
-	camBuf = (u16*)linearAlloc(PW * PH * 2);
-	camFrame = (u16*)malloc(PW * PH * 2);
 	micBuf = (u8*)memalign(0x1000, 0x30000);
-	if (!topCache || !topDim || !wtab || !tape || !smp || !smpUndo || !rawMic || !camBuf || !camFrame || !micBuf) {
-		consoleInit(GFX_TOP, NULL); printf("PhotoTape: out of memory\nPress START");
-		while (aptMainLoop()) { hidScanInput(); if (hidKeysDown() & KEY_START) break; gspWaitForVBlank(); }
-		gfxExit(); return 0;
-	}
-	memset(tapePeak, 0, sizeof(tapePeak)); memset(smpPeak, 0, sizeof(smpPeak));
+	if (micBuf && R_SUCCEEDED(micInit(micBuf, 0x30000))) { micOK = 1; micDataSize = micGetSampleDataSize(); }
 
-	if (R_SUCCEEDED(micInit(micBuf, 0x30000))) { micOK = 1; micDataSize = micGetSampleDataSize(); }
-
-	defaultPattern();
-	genDefaultPhoto();
-	analyzePhoto(); buildCaches(); buildWavetables();
-	renderTape();   // audio not running yet; hold is a no-op
-	scanLib();
-
-	// audio
+	int audioOK = R_SUCCEEDED(ndspInit());
 	Thread athr = NULL;
-	audioOK = R_SUCCEEDED(ndspInit());
 	if (audioOK) {
 		ndspSetOutputMode(NDSP_OUTPUT_STEREO);
 		ndspChnReset(0);
-		ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
+		ndspChnSetInterp(0, NDSP_INTERP_NONE);
 		ndspChnSetRate(0, SR);
 		ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
 		float mix[12]; memset(mix, 0, sizeof(mix)); mix[0] = mix[1] = 1.0f;
@@ -1497,287 +1640,163 @@ int main(void) {
 		for (int i = 0; i < NBUFS; i++) {
 			wbuf[i].data_vaddr = audioMem + i * BUF_SAMPLES * 2;
 			wbuf[i].nsamples = BUF_SAMPLES;
-			memset(audioMem + i * BUF_SAMPLES * 2, 0, BUF_SAMPLES * 4);
-			DSP_FlushDataCache(audioMem + i * BUF_SAMPLES * 2, BUF_SAMPLES * 4);
+			memset((void*)wbuf[i].data_vaddr, 0, BUF_SAMPLES * 4);
+			DSP_FlushDataCache(wbuf[i].data_vaddr, BUF_SAMPLES * 4);
 			ndspChnWaveBufAdd(0, &wbuf[i]);
 		}
-		LightEvent_Init(&audioEvent, RESET_ONESHOT);
-		ndspSetCallback(audioCallback, NULL);
+		LightEvent_Init(&audioEv, RESET_ONESHOT);
+		ndspSetCallback(ndspCb, NULL);
 		s32 prio = 0x30; svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
 		athr = threadCreate(audioThread, NULL, 32 * 1024, prio - 1, -2, false);
 	}
-	if (!audioOK) say("NO DSP FIRM - AUDIO OFF");
+	if (!audioOK) say("NO AUDIO: RUN DSP1 ONCE (dspfirm.cdc)");
 
-	camStart();
-
-	// touch / drag state
-	enum { DR_NONE, DR_STRIP, DR_SLIDER, DR_GRID, DR_LANE, DR_WAVE, DR_PAD };
-	int drag = DR_NONE, dragIdx = 0, dragX0 = 0, dragMoved = 0, paintVal = 1, waveMarker = 0;
-	int lastPaintCell = -1;
-	int prevPage = page;
+	int touchK = -1, touchSlot = 15;
+	int tapCount = 0; u64 tapLast = 0; double tapAcc = 0;
 
 	while (aptMainLoop()) {
 		hidScanInput();
-		u32 kDown = hidKeysDown(), kHeld = hidKeysHeld(), kUp = hidKeysUp();
-		if ((kHeld & KEY_SELECT) && (kDown & KEY_START)) break;
-		if ((kDown & KEY_START) && !(kHeld & KEY_SELECT)) {
-			playing = !playing;
-			if (playing) seqResetReq = 1; else curStep = -1;
-		}
-		if (kDown & KEY_SELECT) page = (page + 1) % PG_COUNT;
-
-		touchPosition t; int touching = !!(kHeld & KEY_TOUCH), touchDown = !!(kDown & KEY_TOUCH);
-		if (touching) hidTouchRead(&t); else { t.px = 0; t.py = 0; }
-		if (touchDown && t.py < 20) { page = t.px / 53; if (page >= PG_COUNT) page = PG_COUNT - 1; touchDown = 0; drag = DR_NONE; }
-
-		if (page != prevPage) {
-			if (page == PG_CAM) camStart(); else camStop();
-			if (prevPage == PG_GRAIN) grainTouch = 0;
-			if (prevPage == PG_KEYS && keysHeldPad >= 0) {
-				int deg = keysHeldPad + keysOct * SCALES[P.scale].n;
-				pushEv(keysMode == 0 ? EV_SYN_OFF : EV_GRAIN_OFF, 0, deg); keysHeldPad = -1;
-			}
-			if (prevPage == PG_MIC && recording) recStop();
-			drag = DR_NONE; prevPage = page;
-		}
+		u32 kDown = hidKeysDown(), kHeld = hidKeysHeld(), kUp = hidKeysUp(), kRep = hidKeysDownRepeat();
+		if ((kHeld & KEY_SELECT) && (kDown & KEY_START) && !btnMode) break;
+		if ((kDown & KEY_SELECT) && (kHeld & KEY_START) && !btnMode) break;
 
 		circlePosition cp; hidCircleRead(&cp);
-		float cx = cp.dx / 156.0f, cy = cp.dy / 156.0f;
-		if (fabsf(cx) < 0.15f) cx = 0; if (fabsf(cy) < 0.15f) cy = 0;
+		circleY = cp.dy / 150.0f;
+		repeatOn = !!(kHeld & KEY_R);
 
-		switch (page) {
-		// ------------------------------------------------ CAM
-		case PG_CAM: {
-			int prev = 0, next = 0;
-			if (touchDown) {
-				if (inBox(t.px, t.py, 0, 150, 80, 46)) prev = 1;
-				else if (inBox(t.px, t.py, 240, 150, 80, 46)) next = 1;
-				else if (inBox(t.px, t.py, 80, 150, 160, 46)) kDown |= KEY_A;
-				else if (inBox(t.px, t.py, 0, 200, 106, 38)) kDown |= KEY_Y;
-				else if (inBox(t.px, t.py, 106, 200, 107, 38)) kDown |= KEY_B;
-				else if (inBox(t.px, t.py, 213, 200, 107, 38)) kDown |= KEY_X;
+		micPoll();
+
+		// ---------- buttons
+		if (kDown & KEY_START) transportToggle();
+		if (btnMode) {
+			static const u32 MAP[9] = {KEY_DLEFT, KEY_DDOWN, KEY_DRIGHT, KEY_DUP, KEY_Y, KEY_B, KEY_A, KEY_X, KEY_L};
+			for (int k = 0; k < 9; k++) {
+				if (kDown & MAP[k]) padDown(k, 127, k, 0);
+				if (kUp & MAP[k]) padUp(k);
 			}
-			if (kDown & KEY_DLEFT) prev = 1;
-			if (kDown & KEY_DRIGHT) next = 1;
-			if (prev || next) {
-				scanLib();
-				if (next) libIdx = libIdx + 1 >= libN ? -1 : libIdx + 1;
-				else libIdx = libIdx - 1 < -1 ? libN - 1 : libIdx - 1;
-				loadLibIdx();
-			}
-			if (kDown & KEY_A) doSnap();
-			if (kDown & KEY_X) { camStop(); camInner = !camInner; camStart(); }
-			if (kDown & KEY_Y) { tapeMode = (tapeMode + 1) % TM_COUNT; if (tapeMode == TM_MIC && smpE - smpS < 1000) tapeMode = TM_SPECTRAL; renderTape(); say(TM_NAMES[tapeMode]); }
-			if (kDown & KEY_B) doSavePatch();
-			if (kDown & (KEY_DUP | KEY_DDOWN)) {
-				P.root = (P.root + ((kDown & KEY_DUP) ? 1 : 11)) % 12;
-				if (tapeMode == TM_SPECTRAL || tapeMode == TM_WAVE) renderTape();
-				char s[16]; snprintf(s, sizeof(s), "ROOT %s", NOTE_NAMES[P.root]); say(s);
-			}
-			break; }
-		// ------------------------------------------------ TAPE / GRAIN
-		case PG_TAPE:
-		case PG_GRAIN: {
-			float* v = page == PG_TAPE ? tp : gp;
-			if (touchDown) {
-				if (inBox(t.px, t.py, 0, STRIP_Y, 320, STRIP_H)) { drag = DR_STRIP; dragX0 = t.px; dragMoved = 0; }
-				else if (t.py >= SL_Y) { drag = DR_SLIDER; dragIdx = (t.py - SL_Y) / SL_H; if (dragIdx > 5) dragIdx = 5; }
-			}
-			if (touching && drag == DR_SLIDER) {
-				float nv = clampf((t.px - 50) / 210.0f, 0, 1);
-				if (page == PG_TAPE && dragIdx == 0) { tapeSync = 0; if (fabsf(nv - 0.5f) < 0.025f) nv = 0.5f; }
-				if (page == PG_GRAIN && dragIdx == 3) nv = (roundf((nv - 0.5f) * 48.0f)) / 48.0f + 0.5f;
-				v[dragIdx] = nv;
-			}
-			if (page == PG_TAPE) {
-				if (touching && drag == DR_STRIP) {
-					if (abs(t.px - dragX0) > 6) dragMoved = 1;
-					if (dragMoved) {
-						int a = dragX0 < t.px ? dragX0 : t.px, b = dragX0 < t.px ? t.px : dragX0;
-						loopS = a / 320.0f; loopE = clampf((b + 1) / 320.0f, 0, 1);
-					}
+			if (kDown & KEY_SELECT) { recOn ^= 1; recPassArmed = 1; hdrDirty = topDirty = 1; }
+		} else {
+			if (kDown & KEY_SELECT) { page = (page + 1) % PG_COUNT; topDirty = hdrDirty = padsDirty = 1; if (page == PG_CHOP) { chopSrc = selPad; chopCompute(); } if (page == PG_DISK) scanDir(); }
+			int big = !!(kHeld & KEY_L);
+			if (page == PG_DISK) {
+				if (kRep & KEY_DUP) { if (fileSel > 0) fileSel--; topDirty = 1; }
+				if (kRep & KEY_DDOWN) { if (fileSel < fileCount - 1) fileSel++; topDirty = 1; }
+				if (kRep & KEY_DLEFT) { projSlot = (projSlot + 15) % 16; confirmAct = 0; topDirty = 1; }
+				if (kRep & KEY_DRIGHT) { projSlot = (projSlot + 1) % 16; confirmAct = 0; topDirty = 1; }
+				if (kDown & KEY_A) diskLoadFile();
+				if (kDown & KEY_B) diskSavePad();
+				if (kDown & KEY_X) {
+					if (projExists(projSlot) && confirmAct != 1) { confirmAct = 1; say("OVERWRITE? PRESS X AGAIN"); }
+					else { confirmAct = 0; say("SAVING..."); drawTop(); gfxFlushBuffers(); int ok = projSave(projSlot); say(ok ? "PROJECT SAVED" : "SAVE FAILED"); }
 				}
-				if (!touching && drag == DR_STRIP) {
-					if (!dragMoved) {
-						float f = dragX0 / 320.0f;
-						if (f < loopS || f > loopE) { loopS = 0; loopE = 1; }
-						tapeJumpReq = f;
-						if (!tapeRun) tapeRun = 1;
-					}
-				}
-				if (kDown & KEY_A) tapeRun = !tapeRun;
-				if (kDown & KEY_B) tapeDir = -tapeDir;
-				if (kDown & KEY_Y) { tapeSync = (tapeSync + 1) % 4; say(tapeSync ? (tapeSync == 1 ? "SYNC 1 BAR" : tapeSync == 2 ? "SYNC 2 BARS" : "SYNC 4 BARS") : "SYNC OFF"); }
-				if (kDown & KEY_X) { loopS = 0; loopE = 1; }
-			} else {
-				if (touching && drag == DR_STRIP) { grainPos = clampf(t.px / 320.0f, 0, 0.999f); grainTouch = 1; }
-				else grainTouch = 0;
-				if (kDown & (KEY_A | KEY_R)) { grainLatch = !grainLatch; say(grainLatch ? "LATCH ON" : "LATCH OFF"); }
-				if (kDown & KEY_X) { grainSrc = !grainSrc; if (grainSrc && smpE - smpS < 512) { grainSrc = 0; say("RECORD A SAMPLE FIRST"); } else say(grainSrc ? "SOURCE MIC" : "SOURCE TAPE"); }
-				if (cx != 0) grainPos = clampf(grainPos + cx * 0.006f, 0, 0.999f);
-			}
-			if (!touching) drag = DR_NONE;
-			break; }
-		// ------------------------------------------------ SEQ
-		case PG_SEQ: {
-			if (touchDown) {
-				if (t.py >= 22 && t.py < 22 + NTR * 16) {
-					int tr = (t.py - 22) / 16;
-					if (t.px < 32) { selTrack = tr; drag = DR_NONE; }
+				if (kDown & KEY_Y) {
+					if (!projExists(projSlot)) say("NOTHING SAVED IN THIS SLOT");
+					else if (confirmAct != 2) { confirmAct = 2; say("LOAD? UNSAVED WORK IS LOST. Y AGAIN"); }
 					else {
-						int s = (t.px - 32) / 18; if (s > 15) s = 15;
-						paintVal = !seq[tr][s].on; seq[tr][s].on = paintVal; selTrack = tr;
-						drag = DR_GRID; lastPaintCell = tr * 16 + s;
-					}
-				} else if (t.py >= 138 && t.py < 218 && t.px >= 32) drag = DR_LANE;
-			}
-			if (touching && drag == DR_GRID && t.py >= 22 && t.py < 22 + NTR * 16 && t.px >= 32) {
-				int tr = (t.py - 22) / 16, s = (t.px - 32) / 18; if (s > 15) s = 15;
-				if (tr * 16 + s != lastPaintCell) { seq[tr][s].on = paintVal; lastPaintCell = tr * 16 + s; }
-			}
-			if (touching && drag == DR_LANE && t.px >= 32) {
-				int s = (t.px - 32) / 18; if (s > 15) s = 15;
-				float f = clampf((218 - t.py) / 80.0f, 0, 1);
-				if (selTrack >= T_SYNTH) seq[selTrack][s].val = (s8)(roundf(f * 21) - 7);
-				else seq[selTrack][s].val = (s8)clampf(roundf(f * 15), 1, 15);
-			}
-			if (!touching) drag = DR_NONE;
-			if (kDown & KEY_L) selTrack = (selTrack + NTR - 1) % NTR;
-			if (kDown & KEY_R) selTrack = (selTrack + 1) % NTR;
-			if (kDown & KEY_A) trMute[selTrack] = !trMute[selTrack];
-			if (kDown & KEY_X) { genFromPhoto(selTrack); say("FROM PHOTO"); }
-			if (kDown & KEY_Y) { for (int s = 0; s < NSTEP; s++) seq[selTrack][s].on = 0; say("CLEARED"); }
-			if (kDown & KEY_B) pushEv(EV_DRUM, selTrack, selTrack >= T_SYNTH ? 0 : 12);
-			static int rep = 0;
-			if (kHeld & (KEY_DUP | KEY_DDOWN)) {
-				if ((kDown & (KEY_DUP | KEY_DDOWN)) || (++rep > 20 && rep % 3 == 0)) {
-					int nt = tempo + ((kHeld & KEY_DUP) ? 1 : -1); tempo = nt < 40 ? 40 : (nt > 240 ? 240 : nt);
-				}
-			} else rep = 0;
-			if (kDown & KEY_DRIGHT) swing = clampf(swing + 0.05f, 0, 0.6f);
-			if (kDown & KEY_DLEFT) swing = clampf(swing - 0.05f, 0, 0.6f);
-			if (cx != 0) trTune[selTrack] = clampf(trTune[selTrack] + cx * 0.012f, 0, 1);
-			if (cy != 0) trDecay[selTrack] = clampf(trDecay[selTrack] + cy * 0.012f, 0, 1);
-			break; }
-		// ------------------------------------------------ MIC
-		case PG_MIC: {
-			if (touchDown) {
-				if (inBox(t.px, t.py, 0, 22, 320, 100) && smpLen > 0 && !recording) {
-					int sx = (int)((long long)t.px * smpLen / 320);
-					waveMarker = abs(sx - smpS) <= abs(sx - smpE) ? 0 : 1;
-					drag = DR_WAVE;
-				}
-				else if (inBox(t.px, t.py, 0, 128, 80, 34)) kDown |= KEY_A;
-				else if (inBox(t.px, t.py, 80, 128, 80, 34)) kDown |= KEY_B;
-				else if (inBox(t.px, t.py, 160, 128, 80, 34)) { edTrim(); say("TRIM"); }
-				else if (inBox(t.px, t.py, 240, 128, 80, 34)) { edNorm(); say("NORMALIZE"); }
-				else if (inBox(t.px, t.py, 0, 164, 80, 34)) { edRev(); say("REVERSE"); }
-				else if (inBox(t.px, t.py, 80, 164, 80, 34)) { edFade(); say("FADE"); }
-				else if (inBox(t.px, t.py, 160, 164, 80, 34)) { edUndo(); say(haveUndo ? "UNDO" : "NOTHING TO UNDO"); }
-				else if (inBox(t.px, t.py, 240, 164, 80, 34)) {
-					if (smpE - smpS >= 1000) { tapeMode = TM_MIC; renderTape(); say("SAMPLE -> TAPE"); } else say("RECORD A SAMPLE FIRST");
-				}
-				else if (inBox(t.px, t.py, 0, 200, 106, 38)) {
-					if (smpE - smpS > 0) {
-						ensureDir();
-						static int wavN = 0; char path[64]; FILE* f;
-						do { wavN++; snprintf(path, sizeof(path), PT_DIR "/S%04d.wav", wavN); f = fopen(path, "rb"); if (f) fclose(f); } while (f && wavN < 9999);
-						char s[24]; snprintf(s, sizeof(s), "S%04d.WAV", wavN);
-						say(saveWAV(path, smp + smpS, smpE - smpS) ? s : "SAVE FAILED");
+						confirmAct = 0; say("LOADING..."); drawTop(); gfxFlushBuffers();
+						lock(); playState = 0; int ok = projLoad(projSlot); seqResync(); unlock();
+						say(ok ? "PROJECT LOADED" : "LOAD FAILED"); padsDirty = hdrDirty = 1;
 					}
 				}
-				else if (inBox(t.px, t.py, 106, 200, 107, 38)) {
-					grainSrc = !grainSrc; if (grainSrc && smpE - smpS < 512) grainSrc = 0;
-				}
-				else if (inBox(t.px, t.py, 213, 200, 107, 38)) micGainIdx = (micGainIdx + 1) % 4;
-			}
-			if (touching && drag == DR_WAVE && smpLen > 0) {
-				int sx = (int)((long long)clampf(t.px, 0, 320) * smpLen / 320);
-				if (waveMarker == 0) smpS = sx < smpE - 64 ? sx : smpE - 64; else smpE = sx > smpS + 64 ? sx : smpS + 64;
-				if (smpS < 0) smpS = 0; if (smpE > smpLen) smpE = smpLen;
-			}
-			if (!touching) drag = DR_NONE;
-			if (kDown & KEY_A) { if (recording) { if (recStop()) say("GOT IT"); else say("TOO SHORT"); } else { recStart(); if (!recording) say("MIC ERROR"); } }
-			if (kDown & KEY_B) pushEv(EV_SMP, 0, 0);
-			int step = smpLen / 400 + 1;
-			if (kHeld & KEY_L) smpS = smpS - step < 0 ? 0 : smpS - step;
-			if (kHeld & KEY_R) smpS = smpS + step < smpE - 64 ? smpS + step : smpS;
-			if (kHeld & KEY_ZL) smpE = smpE - step > smpS + 64 ? smpE - step : smpE;
-			if (kHeld & KEY_ZR) smpE = smpE + step > smpLen ? smpLen : smpE + step;
-			if (kHeld & KEY_DLEFT) smpS = smpS - step < 0 ? 0 : smpS - step;
-			if (kHeld & KEY_DRIGHT) smpS = smpS + step < smpE - 64 ? smpS + step : smpS;
-			if (kHeld & KEY_DDOWN) smpE = smpE - step > smpS + 64 ? smpE - step : smpE;
-			if (kHeld & KEY_DUP) smpE = smpE + step > smpLen ? smpLen : smpE + step;
-			if (recording && rawLen >= RAW_MAX) { recStop(); say("MAX 6s"); }
-			break; }
-		// ------------------------------------------------ KEYS
-		case PG_KEYS: {
-			int n = SCALES[P.scale].n;
-			int pad = -1;
-			if (touching && t.py >= 22 && t.py < 122) { int col = t.px / 40, row = 1 - (t.py - 22) / 50; if (col > 7) col = 7; pad = row * 8 + col; }
-			if (pad != keysHeldPad) {
-				if (keysHeldPad >= 0) {
-					int deg = keysHeldPad + keysOct * n;
-					if (keysMode == 0) pushEv(EV_SYN_OFF, 0, deg); else if (keysMode == 1) pushEv(EV_GRAIN_OFF, 0, deg);
-				}
-				if (pad >= 0) {
-					int deg = pad + keysOct * n;
-					if (keysMode == 0) pushEv(EV_SYN_ON, 0, deg);
-					else if (keysMode == 1) pushEv(EV_GRAIN_ON, 0, deg);
-					else pushEv(EV_SMP, 0, deg);
-					if (kHeld & KEY_R) keysRecord(T_SYNTH + keysMode, deg);
-				}
-				keysHeldPad = pad;
-			}
-			if (touchDown && t.py >= 126 && t.py < 180) {
-				int d = t.px / 80; if (d > 3) d = 3;
-				pushEv(EV_DRUM, d, 12);
-				if (kHeld & KEY_R) keysRecord(d, 12);
-			}
-			if (touchDown && t.py >= 184 && t.py < 216) {
-				int m = t.px / 106; if (m > 2) m = 2;
-				keysMode = m;
-			}
-			if (kDown & KEY_Y) { if (keysHeldPad < 0) keysMode = (keysMode + 1) % 3; }
-			if (kDown & KEY_DUP) keysOct = keysOct < 2 ? keysOct + 1 : 2;
-			if (kDown & KEY_DDOWN) keysOct = keysOct > -2 ? keysOct - 1 : -2;
-			if (kDown & KEY_A) pushEv(EV_DRUM, T_KICK, 12);
-			if (kDown & KEY_B) pushEv(EV_DRUM, T_SNARE, 12);
-			if (kDown & KEY_X) pushEv(EV_DRUM, T_HAT, 12);
-			if (kDown & KEY_L) pushEv(EV_DRUM, T_PERC, 12);
-			break; }
-		}
-		(void)kUp;
+			} else if (big && (kRep & (KEY_DUP | KEY_DDOWN))) {
+				bank = (bank + ((kRep & KEY_DUP) ? 1 : 3)) % 4; hdrDirty = padsDirty = topDirty = 1;
+			} else {
+				int n = fieldCount(page);
+				if (kRep & KEY_DUP) { cursor[page] = (cursor[page] + n - 1) % n; topDirty = 1; }
+				if (kRep & KEY_DDOWN) { cursor[page] = (cursor[page] + 1) % n; topDirty = 1; }
+				if (kRep & KEY_DLEFT) { lock(); fieldChange(page, cursor[page], -1, big); unlock(); }
+				if (kRep & KEY_DRIGHT) { lock(); fieldChange(page, cursor[page], 1, big); unlock(); }
 
-		camPoll();
-		recPoll();
-
-		// draw
-		drawTop();
-		fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL); fbW = 320;
-		switch (page) {
-		case PG_CAM: drawBottomCam(); break;
-		case PG_TAPE: rect(0, 20, 320, 220, 18, 16, 22); drawStrip(1); drawSliders(PG_TAPE); break;
-		case PG_GRAIN: rect(0, 20, 320, 220, 18, 16, 22); drawStrip(0); drawSliders(PG_GRAIN); break;
-		case PG_SEQ: drawBottomSeq(); break;
-		case PG_MIC: drawBottomMic(); break;
-		case PG_KEYS: drawBottomKeys(); break;
+				if (page == PG_SMPL && (kDown & KEY_A)) { if (smplState) smplStop(); else smplStart(); }
+				else if (page == PG_CHOP && (kDown & KEY_A)) chopConvert();
+				else if (kDown & KEY_A) {
+					if (big) { metroSel = metroSel ? 0 : 1; say(metroSel ? "METRONOME ON" : "METRONOME OFF"); }
+					else { recOn ^= 1; recPassArmed = 1; hdrDirty = 1; }
+					topDirty = 1;
+				}
+				if (page == PG_CHOP && (kDown & KEY_X)) chopBpm();
+				else if (kDown & KEY_X) {
+					if (big) {   // tap tempo
+						u64 now = osGetTime();
+						if (now - tapLast > 2000) { tapCount = 0; tapAcc = 0; }
+						else { tapAcc += now - tapLast; tapCount++; }
+						tapLast = now;
+						if (tapCount >= 2) { bpmX10 = clampi((int)(600000.0 / (tapAcc / tapCount) + 0.5), 300, 3000); }
+						char b[24]; snprintf(b, sizeof(b), "TAP %d.%d", bpmX10 / 10, bpmX10 % 10); say(b);
+					} else { lock(); int ok = undoSwap(); unlock(); say(ok ? "UNDO / REDO" : "NOTHING TO UNDO"); padsDirty = 1; }
+					topDirty = 1;
+				}
+				if (kDown & KEY_Y) {
+					if (big) { levels16 ^= 1; say(levels16 ? "16 LEVELS: TUNE" : "16 LEVELS OFF"); hdrDirty = padsDirty = 1; }
+					else { fullLevel ^= 1; say(fullLevel ? "FULL LEVEL ON" : "FULL LEVEL OFF: TOUCH HEIGHT = VEL"); }
+					topDirty = 1;
+				}
+				if ((kDown & KEY_B) && big) {
+					lock(); undoSnap(); seqN[curSeq] = 0; seqResync(); unlock(); say("SEQUENCE CLEARED (X = UNDO)"); padsDirty = 1;
+				}
+			}
 		}
-		drawTabs();
+
+		// ---------- touch
+		touchPosition tp; hidTouchRead(&tp);
+		int touching = !!(kHeld & KEY_TOUCH);
+		if ((kDown & KEY_TOUCH) && tp.py < HDR_H) {
+			int x = tp.px;
+			if (x < 240) { int np = x / 40; if (np != page) { page = np; if (page == PG_CHOP) { chopSrc = selPad; chopCompute(); } if (page == PG_DISK) scanDir(); } }
+			else if (x < 264) bank = (bank + 1) % 4;
+			else if (x < 292) { btnMode ^= 1; say(btnMode ? "BTN MODE: D-PAD/ABXY/L = PADS 1-9" : "BTN MODE OFF"); }
+			else { levels16 ^= 1; say(levels16 ? "16 LEVELS: TUNE" : "16 LEVELS OFF"); }
+			topDirty = hdrDirty = padsDirty = 1;
+		}
+		int k = -1, relY = 0;
+		if (touching && tp.py >= HDR_H) {
+			int col = tp.px / 80, row = (tp.py - HDR_H) / 55;
+			if (col > 3) col = 3; if (row > 3) row = 3;
+			relY = (tp.py - HDR_H) % 55;
+			k = (page == PG_STEP) ? row * 4 + col : (3 - row) * 4 + col;
+		}
+		if (k != touchK) {
+			if (touchK >= 0) padUp(touchSlot);
+			if (k >= 0 && (page != PG_STEP || (kDown & KEY_TOUCH))) {
+				int vel = fullLevel ? 127 : clampi(127 - relY * 100 / 54, 20, 127);
+				padDown(k, vel, touchSlot, kHeld);
+			}
+			touchK = k;
+		}
+
+		// ---------- pad flashes
+		for (int i = 0; i < NPADS; i++) if (hitFlag[i]) {
+			int v = hitFlag[i]; hitFlag[i] = 0;
+			if (levels16 && i == selPad) { if (touchK >= 0) padFlash[touchK] = v / 127.0f; }
+			else if (i / 16 == bank) padFlash[i % 16] = v / 127.0f;
+		}
+		if (page != PG_STEP) {
+			for (int i = 0; i < 16; i++) {
+				float f = padFlash[i];
+				if (fabsf(f - padShown[i]) > 0.04f || (f == 0 && padShown[i] != 0)) { padShown[i] = f; if (!padsDirty) drawPad(i); }
+				padFlash[i] *= 0.82f; if (padFlash[i] < 0.03f) padFlash[i] = 0;
+			}
+		}
+
+		// ---------- draw
+		if (hdrDirty) { drawHeader(); hdrDirty = 0; }
+		if (padsDirty) { drawPads(); padsDirty = 0; }
+		if (topDirty) { drawTop(); topDirty = 0; lastHdrT = -1; lastStepPh = -2; }
+		drawTopLive();
 
 		gfxFlushBuffers();
 		gfxSwapBuffers();
 		gspWaitForVBlank();
 	}
 
-	if (recording) MICU_StopSampling();
-	camStop();
+	if (smplState) MICU_StopSampling();
 	if (audioOK) {
-		audioRun = 0; LightEvent_Signal(&audioEvent);
+		audioQuit = 1; LightEvent_Signal(&audioEv);
 		if (athr) { threadJoin(athr, U64_MAX); threadFree(athr); }
 		ndspChnWaveBufClear(0); ndspExit(); linearFree(audioMem);
 	}
 	if (micOK) micExit();
 	gfxExit();
+	(void)argc; (void)argv;
 	return 0;
 }
