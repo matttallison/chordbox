@@ -59,6 +59,23 @@ With a menu open, the D-pad moves up/down and changes values left/right. B close
 
 **Strum pad:** strings below the chord pads, tuned to the current chord including any joystick change. Swipe across them, and play higher on the strings for louder notes.
 
+## AY Quad engine
+
+The sound engine from the AY Quad Machine, ported to the 2DS: 4 emulated AY-3-8910 chips (12 channels), with the AY volume curve, noise and hardware envelopes, ABC stereo, the RC output filter, a bitcrusher, the BBD chorus (Juno I / Juno II / flanger / vibrato) and a tempo-synced ping-pong echo.
+
+These sounds are added to the sound list (Yellow > SOUND, or Y in the other modes):
+
+| Sound | What it does |
+|---|---|
+| AY PAD | Each chord note on its own channel, detuned A/B/C with the slow pitch wobble |
+| AY LEAD | Square lead with delayed vibrato |
+| AY ARP | The classic chip chord: the whole chord as a 25 Hz arpeggio on one channel |
+| AY BUZZ | Hardware-envelope sawtooth buzz (one per chip), the machine's bass sound |
+| AY BELL | Plucked/decaying square, good on the strum pad |
+| AY STAB | Short detuned stabs |
+
+Yellow menu settings: AY CHORUS, AY ECHO, AY CRUSH (16/8/6/4 bit), AY STEREO (ABC/Split/Mono) and AY DETUNE. The echo follows the BPM.
+
 ## EXPRESS mode
 
 One touch plays a fully voiced chord from a set grouped by feel: Gospel, Neo Soul, Jazz, House, Dark, Lo-Fi (12 chords each).

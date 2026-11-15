@@ -133,7 +133,8 @@ static int voiceChord(const Chord* c, int key, int oct, int voicing, int* out) {
 }
 
 // ---------------------------------------------------------------- synth
-enum { OSC_SAW, OSC_SQUARE, OSC_ORGAN, OSC_TRI, OSC_SINE, OSC_FM };
+enum { OSC_SAW, OSC_SQUARE, OSC_ORGAN, OSC_TRI, OSC_SINE, OSC_FM,
+       OSC_AY_PAD, OSC_AY_LEAD, OSC_AY_ARP, OSC_AY_BUZZ, OSC_AY_BELL, OSC_AY_STAB }; // OSC_AY_*: AY Quad engine (gain = top AY volume step)
 
 typedef struct {
 	const char* name;
@@ -161,6 +162,13 @@ static const Patch PATCHES[] = {
 	{"ORGAN",       OSC_ORGAN,  1,  0.0f, 0.01f, 0.05f, 1.00f, 0.08f, 6000.0f, 0.13f, 0.5f},
 	{"E.PIANO",     OSC_TRI,    2,  4.0f, 0.003f,1.40f, 0.00f, 0.40f, 3500.0f, 0.22f, 0.5f},
 	{"BRASS",       OSC_SAW,    2,  6.0f, 0.03f, 0.25f, 0.70f, 0.20f, 1400.0f, 0.17f, 0.5f, 0, 0, 0, 1},
+	// AY Quad engine (4 x AY-3-8910 + RC filter + BBD chorus + echo)
+	{"AY PAD",      OSC_AY_PAD,  1, 0, 0.50f, 0.30f, 0.85f, 0.80f, 0, 11.0f, 0.5f},
+	{"AY LEAD",     OSC_AY_LEAD, 1, 0, 0.005f,0.35f, 0.75f, 0.08f, 0, 13.0f, 0.5f},
+	{"AY ARP",      OSC_AY_ARP,  1, 0, 0.005f,0.30f, 0.80f, 0.15f, 0, 15.0f, 0.5f},
+	{"AY BUZZ",     OSC_AY_BUZZ, 1, 0, 0.003f,0.40f, 0.80f, 0.10f, 0, 13.0f, 0.5f},
+	{"AY BELL",     OSC_AY_BELL, 1, 0, 0.001f,0.70f, 0.00f, 0.30f, 0, 13.0f, 0.5f},
+	{"AY STAB",     OSC_AY_STAB, 1, 0, 0.002f,0.15f, 0.00f, 0.10f, 0, 13.0f, 0.5f},
 };
 #define NPATCH (int)(sizeof(PATCHES)/sizeof(PATCHES[0]))
 
@@ -171,7 +179,9 @@ typedef struct {
 	float ph[3];
 	float pan, vel;
 	int tag, gate;
-	float fmEnv;       // tag: 1 chord, 2 strum string; gate: samples until auto-release
+	float fmEnv;
+	float t;              // seconds since start (AY vibrato/wobble)
+	int ayCh, ayBuzz;     // AY channel slot (-1 none), envelope buzz started       // tag: 1 chord, 2 strum string; gate: samples until auto-release
 	unsigned age;
 } Voice;
 
@@ -217,6 +227,7 @@ static Voice* noteOn(int note, int delaySamples, float vel) {
 	v->vel = vel;
 	v->tag = 1;
 	v->fmEnv = PATCHES[patchIdx].fmDecay >= 0.0f ? 1.0f : 0.0f;
+	v->ayCh = -1; v->ayBuzz = 0; v->t = 0;
 	v->age = voiceAge++;
 	return v;
 }
@@ -283,8 +294,331 @@ static void arpStep(void) {
 	if (arpGate > 0.0f) v->gate = (int)(arpGate * SR);
 }
 
+
+// ---------------------------------------------------------------- AY QUAD engine
+// C port of Matt's "AY Quad Machine" engine (machine-engine-v6.js): four emulated AY-3-8910
+// chips (12 square/noise channels with the AY log volume curve and hardware envelope), the
+// firmware voice tricks (pad detune + wobble, lead vibrato, fast chord arpeggio, envelope buzz
+// bass, bells, stabs), ABC stereo, the DC blocker, the RC output filter, bitcrush, the BBD
+// chorus (Juno I / Juno II / flanger / vibrato) and the tempo-synced ping-pong echo.
+// ChordBox's voices (chords, strum strings, arps) are mapped onto the 12 AY channels.
+#define AY_CLOCK 1773400
+static const float AY_VOL[16] = {0, 0.0137f, 0.0205f, 0.0291f, 0.0423f, 0.0618f, 0.0847f, 0.1369f,
+	0.1691f, 0.2647f, 0.3527f, 0.4499f, 0.5704f, 0.6873f, 0.8482f, 1.0f};
+static const u8 AY_MASK[16] = {255, 15, 255, 15, 255, 15, 31, 255, 31, 31, 31, 255, 255, 15, 255, 255};
+
+typedef struct {
+	u8 r[16];
+	int tc[3], tp[3]; u8 to[3];
+	int nc, nt, np; u32 lfsr; int no;
+	int ec, ep, estep, eatt, ehold;
+	float out[3];
+} AYChip;
+static AYChip ay[4];
+
+static void ayInit(void) {
+	memset(ay, 0, sizeof(ay));
+	for (int c = 0; c < 4; c++) { ay[c].r[7] = 0x3f; ay[c].lfsr = 1; ay[c].ehold = 1; for (int k = 0; k < 3; k++) ay[c].tp[k] = 1; ay[c].np = 1; ay[c].ep = 1; }
+}
+
+static void ayWrite(AYChip* c, int reg, int v) {
+	v &= AY_MASK[reg];
+	if (reg == 13) { c->r[13] = v; c->ec = 0; c->estep = 15; c->eatt = (v & 4) ? 15 : 0; c->ehold = 0; return; }
+	if (c->r[reg] == v) return;
+	c->r[reg] = v;
+	if (reg < 6) { int ch = reg >> 1; int p = c->r[ch * 2] | (c->r[ch * 2 + 1] << 8); c->tp[ch] = p < 1 ? 1 : p; }
+	else if (reg == 6) c->np = v ? v : 1;
+	else if (reg == 11 || reg == 12) { int p = c->r[11] | (c->r[12] << 8); c->ep = (p ? p : 1) * 2; }
+}
+
+static inline void ayTick(AYChip* c) {
+	for (int k = 0; k < 3; k++) if (++c->tc[k] >= c->tp[k]) { c->tc[k] = 0; c->to[k] ^= 1; }
+	if (++c->nc >= c->np) {
+		c->nc = 0; c->nt ^= 1;
+		if (c->nt) { u32 b = (c->lfsr ^ (c->lfsr >> 3)) & 1; c->lfsr = (c->lfsr >> 1) | (b << 16); c->no = c->lfsr & 1; }
+	}
+	if (!c->ehold && ++c->ec >= c->ep) {
+		c->ec = 0;
+		if (--c->estep < 0) {
+			int s = c->r[13];
+			if (!(s & 8)) { c->ehold = 1; c->eatt = 0; c->estep = 0; }
+			else if (s & 1) { c->ehold = 1; if (s & 2) c->eatt ^= 15; c->estep = 0; }
+			else { if (s & 2) c->eatt ^= 15; c->estep = 15; }
+		}
+	}
+	int env = c->estep ^ c->eatt, m = c->r[7];
+	for (int k = 0; k < 3; k++) {
+		int t = ((m >> k) & 1) | c->to[k];
+		int n = ((m >> (k + 3)) & 1) | c->no;
+		int v = c->r[8 + k];
+		c->out[k] = (t & n) ? AY_VOL[(v & 16) ? env : (v & 15)] : 0.0f;
+	}
+}
+
+// ---- FX state / settings (defaults from the machine)
+static const char* AY_BBD_NAMES[5] = {"OFF", "JUNO I", "JUNO II", "FLANGER", "VIBRATO"};
+static const float AY_BBD_BASE[5] = {0, 3.0f, 3.0f, 0.5f, 2.0f};       // ms at sweep centre
+static const float AY_BBD_RATE[5] = {0, 0.5f, 0.83f, 0.3f, 5.0f};      // LFO Hz
+static const float AY_BBD_DEPTH[5] = {0, 3.5f, 3.5f, 2.0f, 1.2f};      // ms
+static const char* AY_STEREO_NAMES[3] = {"ABC", "SPLIT", "MONO"};
+static const int AY_BITS[4] = {16, 8, 6, 4};
+static int ayBbd = 2, ayEcho = 1, ayCrush = 0, ayStereo = 0;
+static float ayDetune = 8.0f;
+#define AY_DLEN (SR * 2)
+#define AY_BLEN (SR * 6 / 100)
+static float* ayDL; static float* ayDR; static int ayDw = 0;
+static float ayBB[AY_BLEN]; static int ayBw = 0;
+static float ayBph = 0, ayBfb = 0, ayBi1 = 0, ayBi2 = 0, ayBo1 = 0, ayBo2 = 0;
+static float ayAcc = 0, ayXl = 0, ayYl = 0, ayXr = 0, ayYr = 0, ayRl = 0, ayRr = 0, ayHl = 0, ayHr = 0;
+static int ayCc = 0;
+static float ayG[24];
+static int ayGStereo = -1;
+static int aySlotVoice[12];   // voice index on each channel, -1 free
+static float ayArpT = 0;
+static int ayBpm = 100;
+
+static void ayCalcPan(void) {
+	const float w = 0.7f;
+	for (int c = 0; c < 4; c++) for (int ch = 0; ch < 3; ch++) {
+		float p = 0;
+		if (ayStereo == 0) p = (ch == 0) ? -w : (ch == 2 ? w : 0);
+		else if (ayStereo == 1) p = c < 2 ? -w : w;
+		float a = (p + 1) * 3.14159265f / 4;
+		int i = (c * 3 + ch) * 2;
+		ayG[i] = cosf(a); ayG[i + 1] = sinf(a);
+	}
+	ayGStereo = ayStereo;
+}
+
+// slot k -> chip k/3, channel k%3
+static inline int slotChip(int k) { return k / 3; }   // fill one chip's A/B/C before the next (fewer chips running)
+static inline int slotCh(int k) { return k % 3; }
+
+static int ampToVol(float amp, int top) {
+	if (amp <= 0.0005f) return 0;
+	int v = (int)lrintf(top + 2.0f * log2f(amp));   // ~3 dB per AY step
+	return v < 0 ? 0 : (v > 15 ? 15 : v);
+}
+
+static void aySetTone(int chip, int ch, float f) {
+	int tp = (int)lrintf(AY_CLOCK / (16.0f * f));
+	if (tp < 1) tp = 1;
+	if (tp > 4095) tp = 4095;
+	ayWrite(&ay[chip], ch * 2, tp & 255); ayWrite(&ay[chip], ch * 2 + 1, tp >> 8);
+}
+
+// map ChordBox voices onto AY channels (runs at ~500 Hz)
+static void ayControl(const Patch* P, float dt) {
+	float bend = powf(2.0f, bendSemis / 12.0f);
+	int mix[4] = {0x3f, 0x3f, 0x3f, 0x3f};
+	int envUsed[4] = {0, 0, 0, 0};
+	int vol[12]; for (int k = 0; k < 12; k++) vol[k] = 0;
+	int isArp = (P->osc == OSC_AY_ARP);
+
+	// free slots whose voice ended
+	for (int k = 0; k < 12; k++) {
+		int vi = aySlotVoice[k];
+		if (vi >= 0 && (!voices[vi].active || voices[vi].stage == 0 || voices[vi].ayCh != k)) aySlotVoice[k] = -1;
+	}
+	// chord-arp: chord voices (tag 1) collapse into one fast arpeggio on slot 0
+	int arpNotes2[MAXN], an = 0; float arpAmp = 0;
+	if (isArp) {
+		for (int i = 0; i < MAXV; i++) {
+			Voice* v = &voices[i];
+			if (!v->active || v->stage == 0 || v->tag != 1) continue;
+			float amp = v->env * v->vel * exprGain;
+			if (amp > arpAmp) arpAmp = amp;
+			if (an < MAXN) arpNotes2[an++] = v->note;
+			if (v->ayCh >= 0) { aySlotVoice[v->ayCh] = -1; v->ayCh = -1; }
+		}
+		qsort(arpNotes2, an, sizeof(int), cmpInt);
+		ayArpT += dt;
+	}
+	// assign channels to voices that need one (newest first gets priority when full)
+	for (int pass = 0; pass < 2; pass++) for (int i = 0; i < MAXV; i++) {
+		Voice* v = &voices[i];
+		if (!v->active || v->stage == 0) { v->ayCh = -1; continue; }
+		if (isArp && v->tag == 1) continue;
+		if (v->ayCh >= 0) continue;
+		int first = isArp ? 1 : 0, slot = -1;
+		for (int k = first; k < 12; k++) if (aySlotVoice[k] < 0) { slot = k; break; }
+		if (slot < 0 && pass == 1) { // steal the quietest
+			float q = 2.0f;
+			for (int k = first; k < 12; k++) { Voice* o = &voices[aySlotVoice[k]]; float a = o->env * o->vel; if (a < q && o->age < v->age) { q = a; slot = k; } }
+			if (slot >= 0) voices[aySlotVoice[slot]].ayCh = -1;
+		}
+		if (slot >= 0) { aySlotVoice[slot] = i; v->ayCh = slot; }
+	}
+
+	if (isArp && an > 0) {
+		int tones[MAXN + 1], tn = 0;
+		for (int i = 0; i < an; i++) tones[tn++] = arpNotes2[i];
+		tones[tn++] = arpNotes2[0] + 12;
+		int step = (int)(ayArpT * 25.0f);
+		float f = mtof(tones[step % tn]) * bend;
+		aySetTone(0, 0, f); mix[0] &= ~1;
+		vol[0] = ampToVol(arpAmp, (int)P->gain);
+	}
+
+	for (int k = 0; k < 12; k++) {
+		int vi = aySlotVoice[k];
+		if (vi < 0) continue;
+		Voice* v = &voices[vi];
+		int chip = slotChip(k), ch = slotCh(k);
+		float amp = v->env * v->vel * exprGain;
+		float semis = 0;
+		switch (P->osc) {
+		case OSC_AY_PAD: {
+			float det = (ch - 1) * ayDetune / 100.0f;
+			semis = det + 0.03f * sinf(v->t * TWO_PI * 0.25f + ch * 2) * (ayDetune / 8.0f);
+			break; }
+		case OSC_AY_LEAD:
+			if (v->t > 0.18f) { float tt = v->t - 0.18f; semis = sinf(tt * TWO_PI * 6) * 0.25f * (tt * 4 < 1 ? tt * 4 : 1); }
+			break;
+		case OSC_AY_STAB: semis = (ch - 1) * ayDetune / 100.0f; break;
+		default: break;
+		}
+		float f = v->freq * bend * powf(2.0f, semis / 12.0f);
+		if (P->osc == OSC_AY_BUZZ && !envUsed[chip] && amp > 0.2f) {
+			// hardware-envelope buzz (sawtooth shape 8) + a quiet square an octave up, like the machine's bass
+			envUsed[chip] = 1;
+			int ep = (int)lrintf(AY_CLOCK / (256.0f * f));
+			if (ep < 1) ep = 1;
+			if (ep > 65535) ep = 65535;
+			ayWrite(&ay[chip], 11, ep & 255); ayWrite(&ay[chip], 12, ep >> 8);
+			if (!v->ayBuzz) { ayWrite(&ay[chip], 13, 8); v->ayBuzz = 1; }
+			vol[k] = 16;
+			continue;
+		}
+		aySetTone(chip, ch, f);
+		mix[chip] &= ~(1 << ch);
+		vol[k] = ampToVol(amp, (int)P->gain);
+	}
+	for (int k = 0; k < 12; k++) ayWrite(&ay[slotChip(k)], 8 + slotCh(k), vol[k]);
+	for (int c = 0; c < 4; c++) ayWrite(&ay[c], 7, mix[c]);
+}
+
+// voice bookkeeping for a block of samples (envelopes, strum delays, gates, arp/repeat clocks)
+static void voiceBlock(int ns, float aInc, float dDec, float ES) {
+	if (arpOn && arpN > 0) { arpCounter -= ns; if (arpCounter <= 0) { arpCounter += (int)(arpRate * SR); arpStep(); } }
+	if (repOn && repN > 0) {
+		repCounter -= ns;
+		if (repCounter <= 0) {
+			repCounter += (int)(repRate * SR);
+			for (int i = 0; i < MAXV; i++) if (voices[i].tag == 1) releaseVoice(&voices[i]);
+			for (int i = 0; i < repN; i++) { Voice* v = noteOn(repNotes[i], 0, 1.0f); v->gate = (int)(repGate * SR); }
+		}
+	}
+	exprGain += (exprTarget - exprGain) * (1.0f - powf(1.0f - 0.0015f, (float)ns));
+	for (int i = 0; i < MAXV; i++) {
+		Voice* v = &voices[i];
+		if (!v->active) continue;
+		if (v->stage == 0) { v->delay -= ns; if (v->delay <= 0) v->stage = 1; else continue; }
+		if (v->gate > 0) { v->gate -= ns; if (v->gate <= 0) { v->gate = 0; releaseVoice(v); } }
+		v->t += ns / (float)SR;
+		switch (v->stage) {
+		case 1: v->env += aInc * ns; if (v->env >= 1.0f) { v->env = 1.0f; v->stage = 2; } break;
+		case 2: v->env -= dDec * ns; if (v->env <= ES) { v->env = ES; v->stage = 3; } break;
+		case 4: v->env -= v->relRate * ns; if (v->env <= 0.0f) { v->active = 0; v->env = 0; } break;
+		}
+		if (v->active && v->stage == 3 && ES <= 0.0001f) v->active = 0;
+	}
+}
+
+#define AY_BLOCK 64
+static void fillAudioAY(s16* out, int n) {
+	const Patch* P = &PATCHES[patchIdx];
+	float EA, ED, ES, ER;
+	effEnv(P, &EA, &ED, &ES, &ER);
+	float aInc = 1.0f / (EA * SR + 1.0f);
+	float dDec = (1.0f - ES) / (ED * SR + 1.0f);
+	if (ayGStereo != ayStereo) ayCalcPan();
+	const float tps = AY_CLOCK / 8.0f / SR;
+	const float rcA = 1.0f - expf(-TWO_PI * 16000.0f / SR);
+	int bits = AY_BITS[ayCrush], crush = bits < 16;
+	float q = (float)(1 << (bits - 1));
+	int dTime = (int)(0.75f * 60.0f / ayBpm * SR); if (dTime >= AY_DLEN) dTime = AY_DLEN - 1;
+	const float dFb = 0.35f, dMix = 0.22f;
+	int bbdOn = ayBbd > 0;
+	float bbdA = 1.0f - expf(-TWO_PI * 7000.0f / SR);
+	float bBase = AY_BBD_BASE[ayBbd] * SR / 1000.0f, bDepth = AY_BBD_DEPTH[ayBbd] * SR / 1000.0f;
+	float bInc = AY_BBD_RATE[ayBbd] / SR, bFb = (ayBbd == 3) ? 0.6f : 0.0f;
+	int bWetOnly = (ayBbd == 4);
+	const float bMix = 0.6f;
+
+	for (int s = 0; s < n; s++) {
+		if ((s % AY_BLOCK) == 0) {
+			int ns = n - s < AY_BLOCK ? n - s : AY_BLOCK;
+			voiceBlock(ns, aInc, dDec, ES);
+			ayControl(P, ns / (float)SR);
+		}
+		ayAcc += tps;
+		int k = (int)ayAcc; ayAcc -= k;
+		float sl = 0, sr = 0;
+		for (int c = 0; c < 4; c++) {
+			AYChip* chip = &ay[c];
+			// skip a chip that is fully silent (no volume and no envelope use)
+			if (!(chip->r[8] | chip->r[9] | chip->r[10])) continue;
+			float a0 = 0, a1 = 0, a2 = 0;
+			for (int j = 0; j < k; j++) { ayTick(chip); a0 += chip->out[0]; a1 += chip->out[1]; a2 += chip->out[2]; }
+			const float* g = &ayG[c * 6];
+			sl += a0 * g[0] + a1 * g[2] + a2 * g[4];
+			sr += a0 * g[1] + a1 * g[3] + a2 * g[5];
+		}
+		if (k) { sl /= k; sr /= k; }
+		// DC blocker, scale
+		float yl = sl - ayXl + 0.9995f * ayYl; ayXl = sl; ayYl = yl;
+		float yr = sr - ayXr + 0.9995f * ayYr; ayXr = sr; ayYr = yr;
+		float xl = yl * 0.3f, xr = yr * 0.3f;
+		// RC output filter
+		ayRl += rcA * (xl - ayRl); ayRr += rcA * (xr - ayRr);
+		xl = ayRl; xr = ayRr;
+		// bitcrush
+		if (crush) { ayHl = lrintf(xl * q) / q; ayHr = lrintf(xr * q) / q; xl = ayHl; xr = ayHr; }
+		// BBD chorus / flanger / vibrato
+		if (bbdOn) {
+			float inp = (xl + xr) * 0.5f;
+			ayBi1 += bbdA * (inp - ayBi1); ayBi2 += bbdA * (ayBi1 - ayBi2);
+			ayBph += bInc; if (ayBph >= 1) ayBph -= 1;
+			float tri = 4 * fabsf(ayBph - 0.5f) - 1;
+			ayBB[ayBw] = ayBi2 + ayBfb * bFb;
+			float d1 = bBase + bDepth * (1 + tri) * 0.5f, d2 = bBase + bDepth * (1 - tri) * 0.5f;
+			float p1 = ayBw - d1; while (p1 < 0) p1 += AY_BLEN;
+			float p2 = ayBw - d2; while (p2 < 0) p2 += AY_BLEN;
+			int i0 = (int)p1, j0 = (int)p2; float f1 = p1 - i0, f2 = p2 - j0;
+			float wl = ayBB[i0] * (1 - f1) + ayBB[(i0 + 1) % AY_BLEN] * f1;
+			float wr = ayBB[j0] * (1 - f2) + ayBB[(j0 + 1) % AY_BLEN] * f2;
+			ayBfb = wl;
+			ayBo1 += bbdA * (wl - ayBo1); ayBo2 += bbdA * (wr - ayBo2);
+			if (bWetOnly) { xl = ayBo1; xr = ayBo2; }
+			else { xl += ayBo1 * bMix; xr += ayBo2 * bMix; }
+		} else ayBB[ayBw] = 0;
+		if (++ayBw >= AY_BLEN) ayBw = 0;
+		// ping-pong echo, 3/16 note at the current BPM
+		if (ayEcho && ayDL) {
+			int r = ayDw - dTime; if (r < 0) r += AY_DLEN;
+			float dl = ayDL[r], dr = ayDR[r];
+			ayDL[ayDw] = (xl + xr) * 0.5f + dr * dFb;
+			ayDR[ayDw] = dl * dFb;
+			xl += dl * dMix; xr += dr * dMix;
+		} else if (ayDL) { ayDL[ayDw] = 0; ayDR[ayDw] = 0; }
+		if (++ayDw >= AY_DLEN) ayDw = 0;
+
+		xl *= 0.9f; xr *= 0.9f;
+		xl = xl * (27.0f + xl * xl) / (27.0f + 9.0f * xl * xl);
+		xr = xr * (27.0f + xr * xr) / (27.0f + 9.0f * xr * xr);
+		if (xl > 1) xl = 1;
+		if (xl < -1) xl = -1;
+		if (xr > 1) xr = 1;
+		if (xr < -1) xr = -1;
+		out[s * 2] = (s16)(xl * 32000.0f);
+		out[s * 2 + 1] = (s16)(xr * 32000.0f);
+	}
+}
+
 static void fillAudio(s16* out, int n) {
 	const Patch* P = &PATCHES[patchIdx];
+	if (P->osc >= OSC_AY_PAD) { fillAudioAY(out, n); return; }
 	float bend = powf(2.0f, bendSemis / 12.0f);
 	float EA, ED, ES, ER;
 	effEnv(P, &EA, &ED, &ES, &ER);
@@ -980,15 +1314,16 @@ static void hcRelease(void) {
 
 // ---- menus
 enum { MI_KEY, MI_OCT, MI_SOUND, MI_ADSR, MI_SCALE, MI_STICK, MI_BASS, MI_VLEAD, MI_VOICES,
-       MI_MODE, MI_STRUMSPD, MI_RATE, MI_PATTERN, MI_LAYER, MI_BPM };
+       MI_MODE, MI_STRUMSPD, MI_RATE, MI_PATTERN, MI_LAYER, MI_BPM, MI_AYCHORUS, MI_AYECHO, MI_AYCRUSH, MI_AYSTEREO, MI_AYDETUNE };
 static const char* MI_LABEL[] = {"KEY", "OCTAVE", "SOUND", "ADSR", "SCALE", "JOYSTICK", "BASS", "VLEAD",
-	"VOICES", "MODE", "STRUM SPD", "RATE", "PATTERN", "LAYER", "BPM"};
+	"VOICES", "MODE", "STRUM SPD", "RATE", "PATTERN", "LAYER", "BPM", "AY CHORUS", "AY ECHO", "AY CRUSH", "AY STEREO", "AY DETUNE"};
 
 static int hcMenuItems(int menu, int* ids) {
 	int n = 0;
 	if (menu == 1) { ids[n++] = MI_KEY; ids[n++] = MI_OCT; }
 	else if (menu == 2) { ids[n++] = MI_SOUND; ids[n++] = MI_ADSR; ids[n++] = MI_SCALE; ids[n++] = MI_STICK;
-		ids[n++] = MI_BASS; ids[n++] = MI_VLEAD; ids[n++] = MI_VOICES; }
+		ids[n++] = MI_BASS; ids[n++] = MI_VLEAD; ids[n++] = MI_VOICES;
+		ids[n++] = MI_AYCHORUS; ids[n++] = MI_AYECHO; ids[n++] = MI_AYCRUSH; ids[n++] = MI_AYSTEREO; ids[n++] = MI_AYDETUNE; }
 	else if (menu == 3) {
 		ids[n++] = MI_MODE;
 		if (hcMode == HM_STRUM) ids[n++] = MI_STRUMSPD;
@@ -1016,6 +1351,11 @@ static void hcMenuValue(int id, char* b, int len) {
 	case MI_PATTERN: snprintf(b, len, "%s", ARP_PAT_NAMES[hcArpPat]); break;
 	case MI_LAYER: snprintf(b, len, "%s", ARP_LAYER_NAMES[hcArpLayer]); break;
 	case MI_BPM: snprintf(b, len, "%d", hcBpm); break;
+	case MI_AYCHORUS: snprintf(b, len, "%s", AY_BBD_NAMES[ayBbd]); break;
+	case MI_AYECHO: snprintf(b, len, "%s", ayEcho ? "ON" : "OFF"); break;
+	case MI_AYCRUSH: snprintf(b, len, "%d BIT", AY_BITS[ayCrush]); break;
+	case MI_AYSTEREO: snprintf(b, len, "%s", AY_STEREO_NAMES[ayStereo]); break;
+	case MI_AYDETUNE: snprintf(b, len, "%d CENTS", (int)ayDetune); break;
 	}
 }
 
@@ -1038,7 +1378,13 @@ static void hcMenuChange(int id, int d) {
 	case MI_PATTERN: hcArpPat = wrap(hcArpPat + d, 5); break;
 	case MI_LAYER: hcArpLayer = !hcArpLayer; break;
 	case MI_BPM: hcBpm += d * 2; if (hcBpm < 40) hcBpm = 40; if (hcBpm > 240) hcBpm = 240; break;
+	case MI_AYCHORUS: ayBbd = wrap(ayBbd + d, 5); break;
+	case MI_AYECHO: ayEcho = !ayEcho; break;
+	case MI_AYCRUSH: ayCrush = wrap(ayCrush + d, 4); break;
+	case MI_AYSTEREO: ayStereo = wrap(ayStereo + d, 3); break;
+	case MI_AYDETUNE: ayDetune += d * 2; if (ayDetune < 0) ayDetune = 0; if (ayDetune > 30) ayDetune = 30; break;
 	}
+	ayBpm = hcBpm;
 }
 
 // ---- drawing
@@ -1059,9 +1405,10 @@ static void hcDrawTop(int audioOK) {
 		rect(6, 28, 248, 14, mc[0], mc[1], mc[2]);
 		drawText(12, 31, MT[hcMenu], 1, 20, 16, 22);
 		drawText(250 - 8 * 7, 31, "B:close", 1, 20, 16, 22);
-		int ids[12]; int n = hcMenuItems(hcMenu, ids);
-		for (int i = 0; i < n; i++) {
-			int y = 47 + i * 14;
+		int ids[16]; int n = hcMenuItems(hcMenu, ids);
+		int first = hcMenuSel > 6 ? hcMenuSel - 6 : 0;
+		for (int i = first; i < n && i < first + 7; i++) {
+			int y = 47 + (i - first) * 14;
 			char v[24]; hcMenuValue(ids[i], v, sizeof(v));
 			if (i == hcMenuSel) rect(8, y - 3, 244, 13, mc[0] / 3, mc[1] / 3, mc[2] / 3);
 			drawText(14, y, MI_LABEL[ids[i]], 1, i == hcMenuSel ? 255 : 170, i == hcMenuSel ? 255 : 160, i == hcMenuSel ? 255 : 180);
@@ -1158,7 +1505,7 @@ static void hcFrame(u32 kDown, u32 kHeld, u32 kUp, int touching, const touchPosi
 	if (hcMenu && now - hcMenuTime > 5000) { hcMenu = 0; *topDirty = 1; }
 
 	if (hcMenu) {
-		int ids[12]; int n = hcMenuItems(hcMenu, ids);
+		int ids[16]; int n = hcMenuItems(hcMenu, ids);
 		if (kDown & KEY_DUP)   { hcMenuSel = wrap(hcMenuSel - 1, n); hcMenuTime = now; *topDirty = 1; }
 		if (kDown & KEY_DDOWN) { hcMenuSel = wrap(hcMenuSel + 1, n); hcMenuTime = now; *topDirty = 1; }
 		int d = (kDown & KEY_DRIGHT) ? 1 : (kDown & KEY_DLEFT) ? -1 : 0;
@@ -1252,6 +1599,9 @@ int main(void) {
 	srand(osGetTime());
 
 	for (int i = 0; i < 1024; i++) sinTab[i] = sinf(TWO_PI * i / 1024.0f);
+	ayInit();
+	for (int k = 0; k < 12; k++) aySlotVoice[k] = -1;
+	ayDL = (float*)calloc(AY_DLEN, sizeof(float)); ayDR = (float*)calloc(AY_DLEN, sizeof(float));
 
 	int audioOK = R_SUCCEEDED(ndspInit());
 	ndspWaveBuf wbuf[NBUFS];
